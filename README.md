@@ -207,7 +207,6 @@ input_audio_config = {
 }
 
 # 非实时问答可能需要更大的缓冲区
-# 可在 file_based_dialog.py 中调整chunk_size
 ```
 
 ## 🔍 使用示例
@@ -221,23 +220,14 @@ input_audio_config = {
 # 3. 说 "你好豆包" 开始对话
 ```
 
-### 示例2：客服录音分析（非实时问答）
-
-```python
-# 使用 batch_dialog.py 批量分析客服录音
-# 1. 准备客服录音文件目录
-# 2. 运行 python batch_dialog.py recordings/ -o analysis/
-# 3. 查看 analysis/batch_result_*.json 获取分析结果
-```
-
 ### 示例3：语音问答系统
 
 ```bash
 # 步骤1：录制问题
-python audio_converter.py record -o questions/q1.wav -d 5
+python audio_converter.py record -o questions/q1.wav
 
 # 步骤2：获取回答
-python file_based_dialog.py  # 修改代码中的input_file路径
+python .\Filedialogue.py .\crosstalk_subset_1_16khz.wav -o output_4.wav  # 修改代码中的input_file路径
 
 # 步骤3：播放回答
 # Windows: start output.wav
