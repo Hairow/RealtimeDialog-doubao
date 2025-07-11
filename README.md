@@ -223,7 +223,7 @@ input_audio_config = {
 ### 示例3：语音问答系统
 
 ```bash
-# 步骤1：录制问题
+# 步骤1：录制问题完成采样频率的额切换
 python audio_converter.py record -o questions/q1.wav
 
 # 步骤2：获取回答
