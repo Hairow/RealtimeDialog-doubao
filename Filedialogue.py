@@ -12,6 +12,7 @@ from realtime_dialog_client import RealtimeDialogClient
 import numpy as np
 import pyaudio
 
+
 class FileBasedDialog:
     """基于文件的对话会话管理类"""
 
@@ -28,6 +29,13 @@ class FileBasedDialog:
 
         # 音频收集线程
         self.is_collecting = True
+        self.collector_thread = None
+
+        # 接收任务
+        self.receive_task = None
+
+    def start_audio_collector(self):
+        """启动音频收集线程"""
         self.collector_thread = threading.Thread(target=self._audio_collector_thread)
         self.collector_thread.daemon = True
         self.collector_thread.start()
@@ -37,15 +45,15 @@ class FileBasedDialog:
         while self.is_collecting:
             try:
                 # 从队列获取音频数据
-                audio_data = self.audio_queue.get(timeout=1.0)
+                audio_data = self.audio_queue.get(timeout=0.1)
                 if audio_data is not None:
                     self.collected_audio.append(audio_data)
-                    # 移除进度显示，避免与调试信息冲突
             except queue.Empty:
-                time.sleep(0.1)
+                continue
             except Exception as e:
-                print(f"\n音频收集错误: {e}")
-                time.sleep(0.1)
+                if self.is_collecting:  # 只在仍在收集时报错
+                    print(f"\n音频收集错误: {e}")
+                time.sleep(0.01)
 
     def handle_server_response(self, response: Dict[str, Any]) -> None:
         """处理服务器响应"""
@@ -67,13 +75,15 @@ class FileBasedDialog:
                   f"payload: {response.get('payload_msg')}")
             if response['event'] == 450:
                 print(f"清空缓存音频: {response['session_id']}")
+                # 清空队列
                 while not self.audio_queue.empty():
                     try:
                         self.audio_queue.get_nowait()
                     except queue.Empty:
-                        continue
+                        break
         elif response['message_type'] == 'SERVER_ERROR':
             print(f"\n[错误] {response['payload_msg']}")
+            self.is_session_finished = True
             raise Exception("服务器错误")
         else:
             print(f"\n[其他响应] {response}")
@@ -81,17 +91,29 @@ class FileBasedDialog:
     async def receive_loop(self):
         """接收服务器响应循环"""
         try:
-            while True:
-                response = await self.client.receive_server_response()
-                self.handle_server_response(response)
-                if 'event' in response and (response['event'] == 152 or response['event'] == 153):
-                    print(f"\n收到会话结束事件: {response['event']}")
-                    self.is_session_finished = True
+            while self.is_running and not self.is_session_finished:
+                try:
+                    # 使用超时避免无限等待
+                    response = await asyncio.wait_for(
+                        self.client.receive_server_response(),
+                        timeout=1.0
+                    )
+                    self.handle_server_response(response)
+                    if 'event' in response and response['event'] in [152, 153]:
+                        print(f"\n收到会话结束事件: {response['event']}")
+                        self.is_session_finished = True
+                        break
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    print(f"接收消息错误: {e}")
                     break
         except asyncio.CancelledError:
             print("接收任务已取消")
         except Exception as e:
-            print(f"接收消息错误: {e}")
+            print(f"接收循环错误: {e}")
+        finally:
+            print("接收循环结束")
 
     async def process_file_input(self, input_file: str) -> None:
         """处理文件输入，替代麦克风输入"""
@@ -119,7 +141,7 @@ class FileBasedDialog:
             print(f"开始发送音频数据...")
             chunk_count = 0
 
-            while self.is_running:
+            while self.is_running and not self.is_session_finished:
                 audio_data = wf.readframes(chunk_size)
                 if not audio_data:
                     break
@@ -129,7 +151,7 @@ class FileBasedDialog:
 
                 # 显示进度
                 progress = (chunk_count / total_chunks) * 100
-                # print(f"\r发送进度: {progress:.1f}% ({chunk_count}/{total_chunks})", end='')
+                print(f"\r发送进度: {progress:.1f}% ({chunk_count}/{total_chunks})", end='', flush=True)
 
                 # 模拟实时发送的延迟
                 chunk_duration = len(audio_data) / (2 * framerate)
@@ -149,18 +171,11 @@ class FileBasedDialog:
         # 处理32位浮点数音频
         if config.output_audio_config["bit_size"] == pyaudio.paFloat32:
             # 将32位浮点数转换为16位整数以保存为标准WAV
-            # 首先将字节数据转换为numpy数组
             float_data = np.frombuffer(combined_audio, dtype=np.float32)
-
-            # 将浮点数（范围-1.0到1.0）转换为16位整数（范围-32768到32767）
-            # 限制在-1.0到1.0范围内避免溢出
             float_data = np.clip(float_data, -1.0, 1.0)
             int_data = (float_data * 32767).astype(np.int16)
-
-            # 转换回字节
             audio_bytes = int_data.tobytes()
             sampwidth = 2  # 16位
-
             print("已将32位浮点音频转换为16位整数格式")
         else:
             # 其他格式的处理
@@ -192,37 +207,87 @@ class FileBasedDialog:
         print(f"原始数据大小: {len(combined_audio)} 字节")
         print(f"保存文件大小: {len(audio_bytes)} 字节")
 
+    async def cleanup(self):
+        """清理资源"""
+        print("开始清理资源...")
+
+        # 停止标志
+        self.is_running = False
+        self.is_session_finished = True
+        self.is_collecting = False
+
+        # 取消接收任务
+        if self.receive_task and not self.receive_task.done():
+            self.receive_task.cancel()
+            try:
+                await self.receive_task
+            except asyncio.CancelledError:
+                pass
+
+        # 等待收集线程结束
+        if self.collector_thread and self.collector_thread.is_alive():
+            self.collector_thread.join(timeout=2.0)
+            if self.collector_thread.is_alive():
+                print("警告：收集线程未能正常结束")
+
+        # 清空队列
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        print("资源清理完成")
 
     async def process_audio_file(self, input_file: str, output_file: str) -> None:
         """处理音频文件的主方法"""
         try:
+            # 启动音频收集线程
+            self.start_audio_collector()
+
             # 连接服务器
+            print("连接服务器...")
             await self.client.connect()
 
             # 启动接收任务
-            asyncio.create_task(self.receive_loop())
+            self.receive_task = asyncio.create_task(self.receive_loop())
 
             # 处理文件输入
             await self.process_file_input(input_file)
 
             # 等待一段时间以确保接收完所有响应
             print("等待服务器响应...")
-            await asyncio.sleep(2)
+            max_wait = 10  # 最多等待10秒
+            wait_start = time.time()
+
+            while not self.is_session_finished and (time.time() - wait_start) < max_wait:
+                await asyncio.sleep(0.1)
+                # 检查是否还在接收数据
+                if self.audio_queue.empty():
+                    await asyncio.sleep(1.0)
+                    if self.audio_queue.empty():
+                        # 如果队列持续为空，可能已经接收完毕
+                        break
 
             # 结束会话
-            await self.client.finish_session()
+            print("结束会话...")
+            try:
+                await self.client.finish_session()
+                # 等待会话结束确认
+                for _ in range(20):  # 最多等待2秒
+                    if self.is_session_finished:
+                        break
+                    await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"结束会话时出错: {e}")
 
-            # 等待会话结束确认
-            while not self.is_session_finished:
+            # 关闭连接
+            try:
+                await self.client.finish_connection()
                 await asyncio.sleep(0.1)
-
-            await self.client.finish_connection()
-            await asyncio.sleep(0.1)
-            await self.client.close()
-
-            # 停止收集线程
-            self.is_collecting = False
-            self.collector_thread.join()
+                await self.client.close()
+            except Exception as e:
+                print(f"关闭连接时出错: {e}")
 
             # 保存音频
             self.save_collected_audio(output_file)
@@ -232,8 +297,10 @@ class FileBasedDialog:
 
         except Exception as e:
             print(f"会话错误: {e}")
-            self.is_collecting = False
             raise
+        finally:
+            # 确保清理资源
+            await self.cleanup()
 
 
 async def main():
@@ -253,7 +320,13 @@ async def main():
 
     # 创建对话实例并处理
     dialog = FileBasedDialog(config.ws_connect_config)
-    await dialog.process_audio_file(args.input, args.output)
+    try:
+        await dialog.process_audio_file(args.input, args.output)
+    finally:
+        # 确保清理
+        await dialog.cleanup()
+        # 给一点时间让所有资源释放
+        await asyncio.sleep(0.5)
 
 
 if __name__ == "__main__":
