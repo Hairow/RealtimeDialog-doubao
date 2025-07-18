@@ -116,48 +116,40 @@ class FileBasedDialog:
             print("接收循环结束")
 
     async def process_file_input(self, input_file: str) -> None:
-        """处理文件输入，替代麦克风输入"""
         print(f"读取音频文件: {input_file}")
 
-        # 读取音频文件
         with wave.open(input_file, 'rb') as wf:
-            # 验证格式
-            if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
-                raise ValueError(
-                    f"音频格式不正确。需要: 1声道, 16bit, 16000Hz。"
-                    f"当前: {wf.getnchannels()}声道, {wf.getsampwidth() * 8}bit, {wf.getframerate()}Hz"
-                )
-
-            # 获取音频信息
-            n_frames = wf.getnframes()
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
             framerate = wf.getframerate()
-            duration = n_frames / framerate
-            print(f"音频时长: {duration:.2f}秒")
 
-            # 按chunk读取并发送
-            chunk_size = config.input_audio_config["chunk"]
-            total_chunks = (n_frames + chunk_size - 1) // chunk_size
+            if nchannels != 1 or sampwidth != 2 or framerate != 16000:
+                raise ValueError(f"不符合要求: {nchannels}通道, {sampwidth * 8}bit, {framerate}Hz")
 
-            print(f"开始发送音频数据...")
+            frame_size = sampwidth * nchannels
+            chunk_bytes = config.input_audio_config["chunk"]
+            frames_per_chunk = chunk_bytes // frame_size
+
             chunk_count = 0
-
             while self.is_running and not self.is_session_finished:
-                audio_data = wf.readframes(chunk_size)
+                audio_data = wf.readframes(frames_per_chunk)
                 if not audio_data:
                     break
 
+                if len(audio_data) < chunk_bytes:
+                    # 补零或直接跳过
+                    audio_data += b'\x00' * (chunk_bytes - len(audio_data))
+
                 await self.client.task_request(audio_data)
+
                 chunk_count += 1
+                print(f"\r发送第 {chunk_count} 块: {len(audio_data)} 字节", end='')
 
-                # 显示进度
-                progress = (chunk_count / total_chunks) * 100
-                print(f"\r发送进度: {progress:.1f}% ({chunk_count}/{total_chunks})", end='', flush=True)
+                # 延迟模拟
+                chunk_duration = len(audio_data) / (frame_size * framerate)
+                await asyncio.sleep(chunk_duration * 1.05)  # 留裕量
 
-                # 模拟实时发送的延迟
-                chunk_duration = len(audio_data) / (2 * framerate)
-                await asyncio.sleep(chunk_duration)
-
-            print(f"\n音频发送完成")
+        print(f"\n音频发送完成，共发送 {chunk_count} 块")
 
     def save_collected_audio(self, output_file: str) -> None:
         """保存收集的音频到文件"""
