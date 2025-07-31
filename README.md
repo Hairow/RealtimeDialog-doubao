@@ -35,8 +35,8 @@
 
 1. **克隆项目**
 ```bash
-git clone https://github.com/yourusername/doubao-voice-dialog.git
-cd doubao-voice-dialog
+git clone https://github.com/SUAT-AIRI/RealtimeDialog-doubao.git
+cd RealtimeDialog-doubao
 ```
 
 2. **安装依赖**
