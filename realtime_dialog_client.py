@@ -18,7 +18,7 @@ class RealtimeDialogClient:
 
     async def connect(self) -> None:
         """建立WebSocket连接"""
-        print(f"url: {self.config['base_url']}, headers: {self.config['headers']}")
+        print(f"url: {self.config['base_url']}")
         self.ws = await websockets.connect(
             self.config['base_url'],
             extra_headers=self.config['headers'],

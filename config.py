@@ -1,3 +1,4 @@
+import os
 import uuid
 import pyaudio
 
@@ -5,8 +6,8 @@ import pyaudio
 ws_connect_config = {
     "base_url": "wss://openspeech.bytedance.com/api/v3/realtime/dialogue",
     "headers": {
-        "X-Api-App-ID": "",
-        "X-Api-Access-Key": "",
+        "X-Api-App-ID": os.getenv("DOUBAO_APP_ID", ""),
+        "X-Api-Access-Key": os.getenv("DOUBAO_ACCESS_KEY", ""),
         "X-Api-Resource-Id": "volc.speech.dialog",  # 固定值
         "X-Api-App-Key": "PlgvMymc7f3tQnJ6",  # 固定值
         "X-Api-Connect-Id": str(uuid.uuid4()),
