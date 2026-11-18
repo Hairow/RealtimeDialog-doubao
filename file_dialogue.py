@@ -34,6 +34,9 @@ class FileBasedDialog:
         # 接收任务
         self.receive_task = None
 
+        # 最近一次收到服务端消息的时间（用于判断静默超时）
+        self.last_response_time = time.time()
+
     def start_audio_collector(self):
         """启动音频收集线程"""
         self.collector_thread = threading.Thread(target=self._audio_collector_thread)
@@ -59,6 +62,8 @@ class FileBasedDialog:
         """处理服务器响应"""
         if response == {}:
             return
+
+        self.last_response_time = time.time()
 
         # 调试信息：打印响应类型和内容
         print(f"\n[DEBUG] 响应类型: {response.get('message_type')}, "
@@ -247,19 +252,16 @@ class FileBasedDialog:
             # 处理文件输入
             await self.process_file_input(input_file)
 
-            # 等待一段时间以确保接收完所有响应
+            # 等待服务器响应：豆包思考+合成需要几秒，静默超过 6 秒才视为结束，最多等 60 秒
             print("等待服务器响应...")
-            max_wait = 10  # 最多等待10秒
+            max_wait = 60
+            idle_timeout = 6  # 连续 6 秒无任何服务端消息则结束
             wait_start = time.time()
 
             while not self.is_session_finished and (time.time() - wait_start) < max_wait:
-                await asyncio.sleep(0.1)
-                # 检查是否还在接收数据
-                if self.audio_queue.empty():
-                    await asyncio.sleep(1.0)
-                    if self.audio_queue.empty():
-                        # 如果队列持续为空，可能已经接收完毕
-                        break
+                await asyncio.sleep(0.2)
+                if time.time() - self.last_response_time > idle_timeout:
+                    break
 
             # 结束会话
             print("结束会话...")
