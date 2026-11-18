@@ -67,8 +67,12 @@ def _chime_bytes() -> bytes:
 
 
 class Companion:
-    def __init__(self, enter_mode: bool = False, debug: bool = False) -> None:
+    def __init__(self, enter_mode: bool = False, debug: bool = False,
+                 synthetic: bool = False) -> None:
         self.enter_mode = enter_mode
+        self.synthetic = synthetic      # --synthetic：不发麦克风，发合成测试音频
+        self._synth_chunks: list | None = None
+        self._synth_idx = 0
         self.session_id = str(uuid.uuid4())
         self.client = RealtimeDialogClient(config=config.ws_connect_config,
                                            session_id=self.session_id)
@@ -146,55 +150,77 @@ class Companion:
 
     # ---------- 接收 ----------
     async def receive_loop(self) -> None:
-        while self.running and not self.session_done:
-            try:
-                resp = await asyncio.wait_for(
-                    self.client.receive_server_response(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                print(f"\n接收中断: {e}")
-                break
-            self.last_response_time = time.time()
-            if resp == {}:
-                continue
-            event = resp.get("event")
-            mt = resp.get("message_type")
-            if mt == "SERVER_ACK" and isinstance(resp.get("payload_msg"), bytes):
-                _elog(f"TTS {len(resp['payload_msg'])}B")
-            elif event not in (450, 451, 50, 150, 154, 52):
-                _elog(f"event={event} mt={mt} payload={str(resp.get('payload_msg'))[:100]}")
-            try:
+        _elog("recv_loop 启动")
+        n_recv = 0
+        n_empty = 0
+        suppressed: dict = {}
+        try:
+            while self.running and not self.session_done:
+                try:
+                    resp = await asyncio.wait_for(
+                        self.client.receive_server_response(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    print(f"\n接收中断: {e}")
+                    _elog(f"recv_loop 异常退出: {e}")
+                    break
+                n_recv += 1
+                self.last_response_time = time.time()
+                if resp == {}:
+                    n_empty += 1
+                    if n_empty <= 5:
+                        _elog(f"空消息#{n_empty} type={type(resp)}")
+                    continue
                 event = resp.get("event")
-                if resp.get("message_type") == "SERVER_ACK" and isinstance(
-                        resp.get("payload_msg"), bytes):
-                    self.audio_q.put(resp["payload_msg"])
-                elif resp.get("message_type") == "SERVER_ERROR":
-                    print(f"\n[服务端错误] {resp.get('payload_msg')}")
-                    self.session_done = True
-                elif event == 451:
-                    payload = resp.get("payload_msg") or {}
-                    for r in payload.get("results", []):
-                        if not r.get("is_interim") and r.get("text"):
-                            _elog(f"转写: {r['text']}")
-                            print(f"\r孩子说: {r['text']}")
-                elif event == 550:
-                    payload = resp.get("payload_msg") or {}
-                    text = payload.get("text", "") if isinstance(payload, dict) else ""
-                    if text:
-                        print(f"豆包: {text}")
-                elif event == 350:   # TTSSentenceStart
-                    self.doubao_speaking = True
-                elif event == 359:   # TTSEnded：本轮语音合成结束
-                    self.doubao_speaking = False
-                elif event == 152 or event == 153:
-                    print(f"\n[会话结束] event={event}")
-                    self.session_done = True
-                elif event not in (450, 451, 50, 150, 154, 52):
-                    print(f"[事件 {event}] {resp.get('payload_msg')}")
-            except Exception as e:
-                # 单条消息解析失败只跳过，不让接收循环静默死亡
-                print(f"\n[解析异常 event={resp.get('event')}] {e}")
+                mt = resp.get("message_type")
+                if mt == "SERVER_ACK" and isinstance(resp.get("payload_msg"), bytes):
+                    _elog(f"TTS {len(resp['payload_msg'])}B (累计recv={n_recv})")
+                elif event in (450, 451, 50, 150, 154, 52):
+                    # 被抑制的事件也计数，每 20 条汇总一次
+                    key = f"ev{event}"
+                    suppressed[key] = suppressed.get(key, 0) + 1
+                    if sum(suppressed.values()) % 20 == 0:
+                        _elog(f"recv统计 total={n_recv} empty={n_empty} "
+                              f"suppressed={suppressed}")
+                    if event == 451:
+                        for r in (resp.get("payload_msg") or {}).get("results", []):
+                            if r.get("is_interim") and r.get("text"):
+                                if sum(suppressed.values()) % 20 == 1:
+                                    _elog(f"interim: {r['text'][:40]}")
+                else:
+                    _elog(f"event={event} mt={mt} payload={str(resp.get('payload_msg'))[:100]}")
+                try:
+                    event = resp.get("event")
+                    if resp.get("message_type") == "SERVER_ACK" and isinstance(
+                            resp.get("payload_msg"), bytes):
+                        self.audio_q.put(resp["payload_msg"])
+                    elif resp.get("message_type") == "SERVER_ERROR":
+                        print(f"\n[服务端错误] {resp.get('payload_msg')}")
+                        self.session_done = True
+                    elif event == 451:
+                        payload = resp.get("payload_msg") or {}
+                        for r in payload.get("results", []):
+                            if not r.get("is_interim") and r.get("text"):
+                                print(f"\r孩子说: {r['text']}")
+                    elif event == 550:
+                        payload = resp.get("payload_msg") or {}
+                        text = payload.get("text", "") if isinstance(payload, dict) else ""
+                        if text:
+                            print(f"豆包: {text}")
+                    elif event == 350:   # TTSSentenceStart
+                        self.doubao_speaking = True
+                    elif event == 359:   # TTSEnded：本轮语音合成结束
+                        self.doubao_speaking = False
+                    elif event == 152 or event == 153:
+                        print(f"\n[会话结束] event={event}")
+                        self.session_done = True
+                except Exception as e:
+                    # 单条消息解析失败只跳过，不让接收循环静默死亡
+                    print(f"\n[解析异常 event={resp.get('event')}] {e}")
+        finally:
+            _elog(f"recv_loop 退出: total={n_recv} empty={n_empty} "
+                  f"suppressed={suppressed} session_done={self.session_done}")
 
     @staticmethod
     def _boost(data: bytes) -> bytes:
@@ -203,14 +229,41 @@ class Companion:
         return np.clip(np.rint(x), -32768, 32767).astype(np.int16).tobytes()
 
     # ---------- 会话中的麦克风（半双工 + 噪门 + 结束词监听） ----------
+    def _prepare_synthetic(self) -> None:
+        """生成合成测试音频（say + afconvert），切成 3200B 块备用。"""
+        import wave as _wave
+        aiff, wav = "/tmp/doubao_synth.aiff", "/tmp/doubao_synth.wav"
+        subprocess.run(["say", "-v", "Samantha",
+                        "Hello Doubao, please tell me a short story about a dragon.",
+                        "-o", aiff], check=True, capture_output=True)
+        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000",
+                        "-c", "1", aiff, wav], check=True, capture_output=True)
+        with _wave.open(wav, "rb") as w:
+            audio = w.readframes(w.getnframes())
+        self._synth_chunks = [audio[i:i + CHUNK]
+                              for i in range(0, len(audio), CHUNK)]
+        print(f"[synthetic] 已生成 {len(self._synth_chunks)} 块测试音频"
+              f"（{len(audio)/32000:.1f}s）")
+
     async def mic_loop(self) -> None:
-        print("麦克风已开，直接说话即可。豆包说话时会自动闭麦。")
+        if self.synthetic and self._synth_chunks is None:
+            self._prepare_synthetic()
+        print("麦克风已开，直接说话即可。豆包说话时会自动闭麦。"
+              if not self.synthetic else "[synthetic] 会话音频来自合成测试文件")
         muted = False
         chunks_sent = 0
         gate_keep = 0   # 噪门放行剩余块数
         self._last_send = 0.0
         while self.running and not self.session_done:
-            raw = self._boost(self.read_chunk())
+            if self.synthetic:
+                if self._synth_idx < len(self._synth_chunks):
+                    raw = self._synth_chunks[self._synth_idx]
+                    self._synth_idx += 1
+                else:
+                    raw = b"\x00" * CHUNK   # 发完后补静音
+                await asyncio.sleep(0.1)
+            else:
+                raw = self._boost(self.read_chunk())
             # 半双工：豆包在说话（合成中或还有音频没放完）就不上行，
             # 同时也不喂 KWS（避免扬声器里的"再见"误触发）
             busy = self.doubao_speaking or not self.audio_q.empty()
@@ -369,7 +422,9 @@ class Companion:
     # ---------- 主流程 ----------
     async def run(self) -> None:
         try:
-            if self.enter_mode:
+            if self.enter_mode or self.synthetic:
+                if self.synthetic:
+                    print("[synthetic] 合成音频对照模式：按回车开始会话")
                 await self._enter_loop()
             else:
                 await self._wake_loop()
@@ -389,4 +444,5 @@ if __name__ == "__main__":
     asyncio.run(Companion(
         enter_mode="--enter" in sys.argv,
         debug="--debug" in sys.argv,
+        synthetic="--synthetic" in sys.argv,
     ).run())
