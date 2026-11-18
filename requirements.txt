@@ -1,5 +1,5 @@
 pyaudio
 websockets==10.1
-dataclasses
 typing-extensions
 numpy
+sherpa-onnx

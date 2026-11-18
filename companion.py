@@ -1,31 +1,47 @@
-"""豆包英语玩伴（阶段2）：回车触发 + 半双工实时对话
+"""豆包英语玩伴（阶段3）：喊"豆包豆包"唤醒 + 半双工实时对话
 
 用法：
-    python companion.py
-    - 按一次回车：结束本次会话（相当于对豆包说"再见"）
+    python companion.py            # 语音唤醒模式（默认）
+    python companion.py --enter    # 回车触发模式（阶段2原版）
+    - 会话中：喊"再见/别说了/停下…"任一结束词即可结束
+    - 待机时：喊"豆包豆包"重新开始
     - Ctrl+C：退出程序
     - 豆包说话期间自动闭麦（半双工），说完自动恢复拾音
 """
 import asyncio
+import math
 import queue
 import signal
+import sys
 import threading
 import time
 import uuid
 
+import numpy as np
 import pyaudio
 
 import config
 from realtime_dialog_client import RealtimeDialogClient
+from wakeup import SAMPLE_RATE as IN_RATE, WAKE_LABEL, WakeSpotter
 
-IN_RATE = config.input_audio_config["sample_rate"]     # 16000
 OUT_RATE = config.output_audio_config["sample_rate"]   # 24000
 CHUNK = config.input_audio_config["chunk"]             # 3200 字节 = 100ms
 IDLE_EXIT_SECONDS = 30  # 服务端 30 秒无响应自动结束会话
 
 
+def _chime_bytes() -> bytes:
+    """一声短促的"叮"，提示唤醒成功。"""
+    rate, dur = 24000, 0.18
+    n = int(rate * dur)
+    t = np.arange(n)
+    fade = np.minimum(1.0, np.minimum(t, n - 1 - t) / (0.02 * rate))
+    wave = 0.5 * np.sin(2 * math.pi * 880 * t / rate) * fade
+    return (wave * 32767).astype(np.int16).tobytes()
+
+
 class Companion:
-    def __init__(self) -> None:
+    def __init__(self, enter_mode: bool = False) -> None:
+        self.enter_mode = enter_mode
         self.session_id = str(uuid.uuid4())
         self.client = RealtimeDialogClient(config=config.ws_connect_config,
                                            session_id=self.session_id)
@@ -38,9 +54,36 @@ class Companion:
         self.running = True            # 程序总开关
         self.session_done = False      # 本次会话结束
         self.last_response_time = time.time()
+        self.kws: WakeSpotter | None = None  # 仅唤醒模式加载
         self.player = threading.Thread(target=self._play_loop, daemon=True)
         self.player.start()
         signal.signal(signal.SIGINT, self._sigint)
+
+    # ---------- 音频流 ----------
+    def open_input(self):
+        """优先 16k 直开；设备不支持则按默认采样率开、读取时重采样。"""
+        try:
+            return self.pa.open(format=pyaudio.paInt16, channels=1,
+                                rate=IN_RATE, input=True,
+                                frames_per_buffer=CHUNK), IN_RATE
+        except OSError:
+            info = self.pa.get_default_input_device_info()
+            rate = int(info["defaultSampleRate"])
+            print(f"[提示] 设备不支持 16k，改用 {rate}Hz 采集并软件重采样")
+            return self.pa.open(format=pyaudio.paInt16, channels=1,
+                                rate=rate, input=True,
+                                frames_per_buffer=CHUNK), rate
+
+    def read_chunk(self, in_stream, rate: int) -> bytes:
+        """读 100ms 音频，必要时重采样到 16k。"""
+        raw = in_stream.read(int(CHUNK * rate / IN_RATE),
+                             exception_on_overflow=False)
+        if rate == IN_RATE:
+            return raw
+        x = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+        target = len(x) * IN_RATE // rate
+        idx = np.linspace(0, len(x) - 1, target)
+        return np.interp(idx, np.arange(len(x)), x).astype(np.int16).tobytes()
 
     # ---------- 播放 ----------
     def _play_loop(self) -> None:
@@ -52,6 +95,9 @@ class Companion:
                     break
                 continue
             self.out_stream.write(data)
+
+    def chime(self) -> None:
+        self.out_stream.write(_chime_bytes())
 
     # ---------- 信号 ----------
     def _sigint(self, sig, frame) -> None:
@@ -98,16 +144,14 @@ class Companion:
             elif event not in (450, 451, 50, 150, 154, 52):
                 print(f"[事件 {event}] {resp.get('payload_msg')}")
 
-    # ---------- 麦克风（半双工） ----------
-    async def mic_loop(self) -> None:
-        in_stream = self.pa.open(
-            format=pyaudio.paInt16, channels=1, rate=IN_RATE,
-            input=True, frames_per_buffer=CHUNK)
+    # ---------- 会话中的麦克风（半双工 + 结束词监听） ----------
+    async def mic_loop(self, in_stream, rate: int) -> None:
         print("麦克风已开，直接说话即可。豆包说话时会自动闭麦。")
         muted = False
         while self.running and not self.session_done:
-            data = in_stream.read(CHUNK, exception_on_overflow=False)
-            # 半双工：豆包在说话（合成中或还有音频没放完）就不上行
+            data = self.read_chunk(in_stream, rate)
+            # 半双工：豆包在说话（合成中或还有音频没放完）就不上行，
+            # 同时也不喂 KWS（避免扬声器里的"再见"误触发）
             busy = self.doubao_speaking or not self.audio_q.empty()
             if busy:
                 if not muted:
@@ -119,44 +163,101 @@ class Companion:
                 muted = False
                 # 多吞掉一小段，避免回声尾巴
                 in_stream.read(CHUNK * 2, exception_on_overflow=False)
+            if self.kws is not None:
+                hit = self.kws.feed(data)
+                if hit and hit != WAKE_LABEL:
+                    print(f"\n[结束词] {hit}")
+                    self.session_done = True
+                    return
             await self.client.task_request(data)
-        in_stream.stop_stream()
-        in_stream.close()
+
+    # ---------- 单次会话 ----------
+    async def run_session(self) -> None:
+        self.session_done = False
+        self.doubao_speaking = False
+        self.last_response_time = time.time()
+        self.audio_q.queue.clear()
+        self.client = RealtimeDialogClient(
+            config=config.ws_connect_config, session_id=str(uuid.uuid4()))
+        in_stream, rate = self.open_input()
+        try:
+            await self.client.connect()
+            if self.kws is not None:
+                self.kws.set_exit_enabled(True)
+            tasks = [asyncio.create_task(self.receive_loop()),
+                     asyncio.create_task(self.mic_loop(in_stream, rate))]
+            try:
+                while self.running and not self.session_done:
+                    if time.time() - self.last_response_time > IDLE_EXIT_SECONDS:
+                        print("\n30 秒没有对话，自动结束本次会话。")
+                        break
+                    await asyncio.sleep(0.2)
+            finally:
+                self.session_done = True
+                await self.client.finish_session()
+                # 等收尾事件/播放完
+                deadline = time.time() + 5
+                while time.time() < deadline and (not self.audio_q.empty()):
+                    await asyncio.sleep(0.1)
+                await asyncio.sleep(0.8)  # 让最后一小段播完
+                for t in tasks:
+                    t.cancel()
+                await self.client.finish_connection()
+                await self.client.close()
+        finally:
+            if self.kws is not None:
+                self.kws.set_exit_enabled(False)
+            in_stream.stop_stream()
+            in_stream.close()
+
+    # ---------- 回车触发模式 ----------
+    async def _enter_loop(self) -> None:
+        print("=" * 50)
+        print("豆包英语玩伴（回车版）")
+        print("  按回车 = 开始会话；会话中再按回车 = 结束")
+        print("  Ctrl+C = 退出")
+        print("=" * 50)
+        loop = asyncio.get_running_loop()
+        while self.running:
+            got = await loop.run_in_executor(None, input)
+            if got == "" and self.running:
+                await self.run_session()
+
+    # ---------- 语音唤醒模式 ----------
+    async def _wake_loop(self) -> None:
+        print("=" * 50)
+        print("豆包英语玩伴（唤醒版）")
+        print("  喊\"豆包豆包\"开始会话")
+        print("  会话中喊\"再见/别说了/停下\"等结束，或 30 秒不说话自动结束")
+        print("  Ctrl+C = 退出")
+        print("=" * 50)
+        self.kws = WakeSpotter(threshold=0.10)
+        print("唤醒词模型已加载，正在监听...")
+        in_stream, rate = self.open_input()
+        try:
+            while self.running:
+                data = self.read_chunk(in_stream, rate)
+                hit = self.kws.feed(data)
+                if hit == WAKE_LABEL:
+                    print("\n🔔 唤醒！")
+                    self.chime()
+                    await self.run_session()
+                    if self.running:
+                        print("已回到待机，喊\"豆包豆包\"可以再来。")
+        finally:
+            in_stream.stop_stream()
+            in_stream.close()
 
     # ---------- 主流程 ----------
     async def run(self) -> None:
-        print("=" * 50)
-        print("豆包英语玩伴（回车版）")
-        print("  直接对 Mac 说话，全程英语陪聊")
-        print("  按回车 = 结束本次会话；Ctrl+C = 退出")
-        print("=" * 50)
-        await self.client.connect()
-        loop = asyncio.get_running_loop()
-        tasks = [asyncio.create_task(self.receive_loop()),
-                 asyncio.create_task(self.mic_loop())]
         try:
-            while self.running and not self.session_done:
-                # 30 秒无任何服务端消息自动结束
-                if time.time() - self.last_response_time > IDLE_EXIT_SECONDS:
-                    print("\n30 秒没有对话，自动结束本次会话。")
-                    break
-                # 回车触发：结束会话
-                got = await loop.run_in_executor(None, input)
-                if got == "" and not self.session_done:
-                    print("结束本次会话...")
-                    break
+            if self.enter_mode:
+                await self._enter_loop()
+            else:
+                await self._wake_loop()
         finally:
+            self.running = False
             self.session_done = True
-            await self.client.finish_session()
-            # 等收尾事件/播放完
-            deadline = time.time() + 5
-            while time.time() < deadline and (not self.audio_q.empty()):
-                await asyncio.sleep(0.1)
-            await asyncio.sleep(0.8)  # 让最后一小段播完
-            for t in tasks:
-                t.cancel()
-            await self.client.finish_connection()
-            await self.client.close()
             self.out_stream.stop_stream()
             self.out_stream.close()
             self.pa.terminate()
@@ -164,4 +265,4 @@ class Companion:
 
 
 if __name__ == "__main__":
-    asyncio.run(Companion().run())
+    asyncio.run(Companion(enter_mode="--enter" in sys.argv).run())
