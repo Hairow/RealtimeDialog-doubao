@@ -29,6 +29,8 @@ OUT_RATE = config.output_audio_config["sample_rate"]   # 24000
 CHUNK = config.input_audio_config["chunk"]             # 3200 字节 = 100ms
 IDLE_EXIT_SECONDS = 30  # 服务端 30 秒无响应自动结束会话
 UPLINK_GAIN = 4.0       # 上行固定增益：Mac 内置麦拾音弱，实测语音 RMS 只有正常 1/5
+GATE_RMS = 0.10         # 上行噪门阈值：低于它的块发静音（增益后底噪~0.06、语音~0.2+）
+GATE_HANGOVER = 10      # 说话结束后保持放行的块数（10 块 = 1 秒，防止切断词尾）
 
 
 def ensure_input_volume(target: int = 100) -> None:
@@ -186,15 +188,14 @@ class Companion:
         x = (np.frombuffer(data, dtype=np.int16).astype(np.float64) * UPLINK_GAIN)
         return np.clip(np.rint(x), -32768, 32767).astype(np.int16).tobytes()
 
-    # ---------- 会话中的麦克风（半双工 + 结束词监听） ----------
+    # ---------- 会话中的麦克风（半双工 + 噪门 + 结束词监听） ----------
     async def mic_loop(self) -> None:
         print("麦克风已开，直接说话即可。豆包说话时会自动闭麦。")
         muted = False
         chunks_sent = 0
+        gate_keep = 0   # 噪门放行剩余块数
         while self.running and not self.session_done:
-            data = self._boost(self.read_chunk())
-            if self.debug:
-                self._debug_buf.append(data)
+            raw = self._boost(self.read_chunk())
             # 半双工：豆包在说话（合成中或还有音频没放完）就不上行，
             # 同时也不喂 KWS（避免扬声器里的"再见"误触发）
             busy = self.doubao_speaking or not self.audio_q.empty()
@@ -208,12 +209,25 @@ class Companion:
                 muted = False
                 # 多吞掉一小段，避免回声尾巴
                 self.drain_input(0.2)
+            # 结束词监听（只在非闭麦时）
             if self.kws is not None:
-                hit = self.kws.feed(data)
+                hit = self.kws.feed(raw)
                 if hit and hit != WAKE_LABEL:
                     print(f"\n[结束词] {hit}")
                     self.session_done = True
                     return
+            # 噪门：增益后底噪仍会顶住服务端 VAD，低于阈值发静音，
+            # 让服务器能判断"说完了"。注意必须用 float64 计算 RMS，
+            # int16 平方会溢出成负数 -> NaN -> 噪门永远不开（踩过的坑）
+            rms = float(np.sqrt(np.mean(
+                np.frombuffer(raw, np.int16).astype(np.float64) ** 2)) / 32768.0)
+            if rms > GATE_RMS:
+                gate_keep = GATE_HANGOVER
+            elif gate_keep > 0:
+                gate_keep -= 1
+            data = raw if gate_keep > 0 else b"\x00" * len(raw)
+            if self.debug:
+                self._debug_buf.append(data)
             try:
                 await self.client.task_request(data)
                 chunks_sent += 1
