@@ -37,6 +37,7 @@ GATE_HANGOVER = 10      # 说话结束后保持放行的块数（10 块 = 1 秒�
 AGC_TARGET = 0.10       # 上行 AGC 目标 RMS（-20dBFS，服务端 VAD 的舒适区）
 AGC_MAX = 10.0          # AGC 最大提升倍数（叠加固定增益后总能盖过阈值）
 GATE_MARGIN = 1.8       # 自适应噪门倍数：超过底噪这么多倍才算"有人在说话"
+ECHO_TAIL = 0.45        # 播放结束后再多闭麦这么久，避免扬声器余音被自己的麦收进去
 READ_TIMEOUT = 3.0      # 秒：arecord 超过这么久不出数据就认为卡死，重启采集
 IS_LINUX = sys.platform.startswith("linux")
 
@@ -322,6 +323,7 @@ class Companion:
                 format=pyaudio.paInt16, channels=1, rate=OUT_RATE,
                 output=True, frames_per_buffer=3200)
         self.audio_q: "queue.Queue[bytes]" = queue.Queue()
+        self.play_deadline = 0.0        # 估算的"声音真正播完"时刻（monotonic）
         self.doubao_speaking = False   # 事件层：豆包正在合成语音
         self.running = True            # 程序总开关
         self.session_done = False      # 本次会话结束
@@ -531,6 +533,11 @@ class Companion:
                     if resp.get("message_type") == "SERVER_ACK" and isinstance(
                             resp.get("payload_msg"), bytes):
                         self.audio_q.put(resp["payload_msg"])
+                        # 队列空 ≠ 声音播完：音频是灌进 aplay 管道的。
+                        # 按字节/采样率累加，估出真正播完的时刻。
+                        self.play_deadline = (
+                            max(self.play_deadline, time.monotonic())
+                            + len(resp["payload_msg"]) / (OUT_RATE * 2.0))
                     elif resp.get("message_type") == "SERVER_ERROR":
                         print(f"\n[服务端错误] {resp.get('payload_msg')}")
                         self.session_done = True
@@ -623,7 +630,8 @@ class Companion:
                 raw = await asyncio.to_thread(self._safe_read)
             # 半双工：豆包在说话（合成中或还有音频没放完）就不上行，
             # 同时也不喂 KWS（避免扬声器里的"再见"误触发）
-            busy = self.doubao_speaking or not self.audio_q.empty()
+            busy = (self.doubao_speaking or not self.audio_q.empty()
+                    or time.monotonic() < self.play_deadline + ECHO_TAIL)
             if busy:
                 if not muted:
                     print("…（豆包说话中，闭麦）")
@@ -699,6 +707,7 @@ class Companion:
         self.drain_input(0.5)   # 丢掉唤醒前后积压的旧音频
         self._debug_buf.clear()
         self._raw_buf.clear()
+        self.play_deadline = 0.0
         self.bursts = 0
         if self.debug:
             try:
