@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,7 @@ IDLE_EXIT_SECONDS = 30  # 服务端 30 秒无响应自动结束会话
 UPLINK_GAIN = 4.0       # 上行固定增益：Mac 内置麦拾音弱，实测语音 RMS 只有正常 1/5
 GATE_RMS = 0.10         # 上行噪门阈值：低于它的块发静音（增益后底噪~0.06、语音~0.2+）
 GATE_HANGOVER = 10      # 说话结束后保持放行的块数（10 块 = 1 秒，防止切断词尾）
+IS_LINUX = sys.platform.startswith("linux")
 
 
 def _elog(msg: str) -> None:
@@ -42,6 +44,8 @@ def _elog(msg: str) -> None:
 
 def ensure_input_volume(target: int = 100) -> None:
     """把系统输入音量拉到 target（Mac 内置麦默认偏低会导致 ASR 听不清）。"""
+    if not sys.platform == "darwin":
+        return   # Linux/其它平台用 amixer 配置，不在这里动
     try:
         cur = int(subprocess.run(
             ["osascript", "-e", "input volume of (get volume settings)"],
@@ -66,20 +70,104 @@ def _chime_bytes() -> bytes:
     return (wave * 32767).astype(np.int16).tobytes()
 
 
+class AlsaCapture:
+    """Linux 采集后端：用 arecord 子进程读 ALSA。
+
+    比 PortAudio 可靠：PortAudio 只枚举 hw:* 硬件设备，看不到 asound.conf
+    里的别名（如蓝牙/环回），而 arecord 认 default 与自动重采样。
+    """
+
+    def __init__(self, device: str = "default", rate: int = IN_RATE,
+                 channels: int = 1) -> None:
+        self.rate = rate
+        self._buf = b""
+        self.proc = subprocess.Popen(
+            ["arecord", "-q", "-D", device, "-f", "S16_LE",
+             "-r", str(rate), "-c", str(channels), "-t", "raw"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+    def read(self, nbytes: int, exception_on_overflow: bool = False) -> bytes:
+        """读满 nbytes（管道 read 可能短读，必须循环凑齐）。"""
+        while len(self._buf) < nbytes:
+            chunk = self.proc.stdout.read(nbytes - len(self._buf))
+            if not chunk:
+                raise OSError("arecord 已退出（设备被占用或不可用）")
+            self._buf += chunk
+        out, self._buf = self._buf[:nbytes], self._buf[nbytes:]
+        return out
+
+    def stop_stream(self) -> None:
+        pass
+
+    def close(self) -> None:
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+class AlsaPlayback:
+    """Linux 播放后端：把 PCM 写进 aplay 子进程。
+
+    device 可填 asound.conf 里的别名（如 bt = 蓝牙音箱），aplay 会自动
+    把 24k 单声道转成蓝牙需要的 48k 立体声。
+    """
+
+    def __init__(self, device: str = "bt", rate: int = OUT_RATE,
+                 channels: int = 1, buffer_us: int = 200000) -> None:
+        self.proc = subprocess.Popen(
+            ["aplay", "-q", "-D", device, "-f", "S16_LE",
+             "-r", str(rate), "-c", str(channels), "-t", "raw",
+             "-B", str(buffer_us)],
+            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def write(self, data: bytes) -> None:
+        try:
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass   # 播放进程已退出（设备断开），丢弃这块音频
+
+    def stop_stream(self) -> None:
+        pass
+
+    def close(self) -> None:
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
 class Companion:
     def __init__(self, enter_mode: bool = False, debug: bool = False,
-                 synthetic: bool = False) -> None:
+                 synthetic: bool = False, alsa: bool = False,
+                 device_in: str = "default", device_out: str = "bt",
+                 gain: float = UPLINK_GAIN, gate: float = GATE_RMS,
+                 threshold: float = 0.10) -> None:
         self.enter_mode = enter_mode
         self.synthetic = synthetic      # --synthetic：不发麦克风，发合成测试音频
+        self.alsa = alsa                # --alsa：Linux 上用 arecord/aplay 子进程
+        self.device_in = device_in
+        self.device_out = device_out
+        self.gain = gain                # 上行固定增益（不同麦克风灵敏度差很多）
+        self.gate = gate                # 上行噪门阈值
+        self.threshold = threshold      # 唤醒词判定阈值（麦克风弱就调低）
         self._synth_chunks: list | None = None
         self._synth_idx = 0
         self.session_id = str(uuid.uuid4())
         self.client = RealtimeDialogClient(config=config.ws_connect_config,
                                            session_id=self.session_id)
-        self.pa = pyaudio.PyAudio()
-        self.out_stream = self.pa.open(
-            format=pyaudio.paInt16, channels=1, rate=OUT_RATE,
-            output=True, frames_per_buffer=3200)
+        self.pa = None
+        if alsa:
+            self.out_stream = AlsaPlayback(device_out, rate=OUT_RATE)
+            print(f"[音频] 输出设备: {device_out!r}")
+        else:
+            self.pa = pyaudio.PyAudio()
+            self.out_stream = self.pa.open(
+                format=pyaudio.paInt16, channels=1, rate=OUT_RATE,
+                output=True, frames_per_buffer=3200)
         self.audio_q: "queue.Queue[bytes]" = queue.Queue()
         self.doubao_speaking = False   # 事件层：豆包正在合成语音
         self.running = True            # 程序总开关
@@ -97,6 +185,9 @@ class Companion:
     # ---------- 音频流 ----------
     def open_input(self):
         """优先 16k 直开；设备不支持则按默认采样率开、读取时重采样。"""
+        if self.alsa:
+            print(f"[音频] 采集设备: {self.device_in!r} @ {IN_RATE}Hz")
+            return AlsaCapture(self.device_in, rate=IN_RATE), IN_RATE
         try:
             return self.pa.open(format=pyaudio.paInt16, channels=1,
                                 rate=IN_RATE, input=True,
@@ -140,7 +231,8 @@ class Companion:
             self.out_stream.write(data)
 
     def chime(self) -> None:
-        self.out_stream.write(_chime_bytes())
+        # 走播放队列，避免主线程与播放线程同时写同一个输出流
+        self.audio_q.put(_chime_bytes())
 
     # ---------- 信号 ----------
     def _sigint(self, sig, frame) -> None:
@@ -222,10 +314,11 @@ class Companion:
             _elog(f"recv_loop 退出: total={n_recv} empty={n_empty} "
                   f"suppressed={suppressed} session_done={self.session_done}")
 
-    @staticmethod
-    def _boost(data: bytes) -> bytes:
+    def _boost(self, data: bytes) -> bytes:
         """上行固定增益 + 饱和限幅（唤醒已有动态 AGC，上行用保守增益）。"""
-        x = (np.frombuffer(data, dtype=np.int16).astype(np.float64) * UPLINK_GAIN)
+        if self.gain == 1.0:
+            return data
+        x = (np.frombuffer(data, dtype=np.int16).astype(np.float64) * self.gain)
         return np.clip(np.rint(x), -32768, 32767).astype(np.int16).tobytes()
 
     # ---------- 会话中的麦克风（半双工 + 噪门 + 结束词监听） ----------
@@ -289,7 +382,7 @@ class Companion:
             # int16 平方会溢出成负数 -> NaN -> 噪门永远不开（踩过的坑）
             rms = float(np.sqrt(np.mean(
                 np.frombuffer(raw, np.int16).astype(np.float64) ** 2)) / 32768.0)
-            if rms > GATE_RMS:
+            if rms > self.gate:
                 gate_keep = GATE_HANGOVER
             elif gate_keep > 0:
                 gate_keep -= 1
@@ -391,11 +484,33 @@ class Companion:
         print("  Ctrl+C = 退出")
         print("=" * 50)
         ensure_input_volume()
-        self.kws = WakeSpotter(threshold=0.10)
-        print("唤醒词模型已加载，正在监听...")
+        self.kws = WakeSpotter(threshold=self.threshold)
+        print(f"唤醒词模型已加载，正在监听...（阈值 {self.threshold}）", flush=True)
+        peak = 0
+        sumsq = 0.0
+        nsamp = 0
+        peak_at = time.time()
         try:
             while self.running:
                 data = self.read_chunk()
+                # 麦克风电平自检：每秒最多打一行，静音时不打，用来区分
+                # "根本没拾到声音" 和 "拾到了但唤醒词没命中"
+                x = np.frombuffer(data, dtype=np.int16)
+                if len(x):
+                    f = x.astype(np.float64) / 32768.0
+                    peak = max(peak, int(np.abs(x.astype(np.int32)).max()))
+                    sumsq += float(np.dot(f, f))
+                    nsamp += len(f)
+                if time.time() - peak_at >= 1.0:
+                    if nsamp and peak > 150:
+                        rms = math.sqrt(sumsq / nsamp)
+                        bar = "#" * min(30, peak // 400)
+                        print(f"[mic] 峰值 {peak:5d} rms {rms:.4f} {bar}",
+                              flush=True)
+                    peak = 0
+                    sumsq = 0.0
+                    nsamp = 0
+                    peak_at = time.time()
                 hit = self.kws.feed(data)
                 if hit == WAKE_LABEL:
                     print("\n🔔 唤醒！")
@@ -435,14 +550,29 @@ class Companion:
             self.in_stream.close()
             self.out_stream.stop_stream()
             self.out_stream.close()
-            self.pa.terminate()
+            if self.pa is not None:
+                self.pa.terminate()
             print("已退出。")
 
 
 if __name__ == "__main__":
-    import wave
+    import argparse
+    ap = argparse.ArgumentParser(description="豆包英语玩伴")
+    ap.add_argument("--enter", action="store_true", help="回车触发模式（默认语音唤醒）")
+    ap.add_argument("--debug", action="store_true", help="保存上行原声，便于排查")
+    ap.add_argument("--synthetic", action="store_true", help="合成音频对照模式")
+    ap.add_argument("--alsa", action="store_true", default=IS_LINUX,
+                    help="用 arecord/aplay 子进程（Linux 默认开，Mac 用 pyaudio）")
+    ap.add_argument("--no-alsa", dest="alsa", action="store_false", help="强制用 pyaudio")
+    ap.add_argument("--device-in", default="default", help="采集设备（arecord -D 的名字）")
+    ap.add_argument("--device-out", default="bt", help="播放设备（aplay -D 的名字）")
+    ap.add_argument("--gain", type=float, default=UPLINK_GAIN, help="上行固定增益")
+    ap.add_argument("--gate", type=float, default=GATE_RMS, help="噪门阈值（0-1 的 RMS）")
+    ap.add_argument("--threshold", type=float, default=0.10,
+                    help="唤醒词阈值（0.05~0.25，麦克风弱就调低）")
+    a = ap.parse_args()
     asyncio.run(Companion(
-        enter_mode="--enter" in sys.argv,
-        debug="--debug" in sys.argv,
-        synthetic="--synthetic" in sys.argv,
+        enter_mode=a.enter, debug=a.debug, synthetic=a.synthetic,
+        alsa=a.alsa, device_in=a.device_in, device_out=a.device_out,
+        gain=a.gain, gate=a.gate, threshold=a.threshold,
     ).run())
