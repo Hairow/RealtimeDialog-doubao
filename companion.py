@@ -11,6 +11,7 @@
 import asyncio
 import math
 import queue
+import select
 import signal
 import subprocess
 import sys
@@ -36,6 +37,7 @@ GATE_HANGOVER = 10      # 说话结束后保持放行的块数（10 块 = 1 秒�
 AGC_TARGET = 0.10       # 上行 AGC 目标 RMS（-20dBFS，服务端 VAD 的舒适区）
 AGC_MAX = 10.0          # AGC 最大提升倍数（叠加固定增益后总能盖过阈值）
 GATE_MARGIN = 1.8       # 自适应噪门倍数：超过底噪这么多倍才算"有人在说话"
+READ_TIMEOUT = 3.0      # 秒：arecord 超过这么久不出数据就认为卡死，重启采集
 IS_LINUX = sys.platform.startswith("linux")
 
 
@@ -188,18 +190,39 @@ class AlsaCapture:
     def __init__(self, device: str = "default", rate: int = IN_RATE,
                  channels: int = 1) -> None:
         self.rate = rate
+        self.device = device
+        self.channels = channels
+        self._buf = b""
+        self._spawn()
+
+    def _spawn(self) -> None:
         self._buf = b""
         self.proc = subprocess.Popen(
-            ["arecord", "-q", "-D", device, "-f", "S16_LE",
-             "-r", str(rate), "-c", str(channels), "-t", "raw",
+            ["arecord", "-q", "-D", self.device, "-f", "S16_LE",
+             "-r", str(self.rate), "-c", str(self.channels), "-t", "raw",
              # 显式指定缓冲/周期（借自 xiaoai-plus 的 recorder_arecord.cpp）：
              # 不指定时驱动会按默认值给，老 HDA 上容易出现周期性抖动和突刺。
              "--buffer-size", "4800", "--period-size", "480"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 
+    def restart(self) -> None:
+        """arecord 卡死/退出后重新拉起来。"""
+        self.close()
+        self._spawn()
+
     def read(self, nbytes: int, exception_on_overflow: bool = False) -> bytes:
-        """读满 nbytes（管道 read 可能短读，必须循环凑齐）。"""
+        """读满 nbytes（管道 read 可能短读，必须循环凑齐）。
+
+        关键：用 select 加超时。管道 read 是阻塞的，一旦 arecord 停止输出
+        （这台老 HDA 上会偶发），阻塞 read 会把整个 asyncio 事件循环冻住
+        —— 接收协程、看门狗全部停摆，表现为"服务端不回应"。宁可抛错让
+        上层重启采集，也不能无声卡死。
+        """
         while len(self._buf) < nbytes:
+            ready, _, _ = select.select([self.proc.stdout], [], [],
+                                        READ_TIMEOUT)
+            if not ready:
+                raise OSError(f"arecord {READ_TIMEOUT:.0f}s 没有输出音频（卡死）")
             chunk = self.proc.stdout.read(nbytes - len(self._buf))
             if not chunk:
                 raise OSError("arecord 已退出（设备被占用或不可用）")
@@ -296,6 +319,7 @@ class Companion:
         self.kws: WakeSpotter | None = None  # 仅唤醒模式加载
         self.debug = debug              # --debug 时保存发给服务器的原声
         self._debug_buf: list[bytes] = []
+        self._dbg_fh = None              # 实时写 debug_sent.raw 的文件句柄
         self.raw_buf_ok = True           # 原始音频留档
         self._raw_buf: list[bytes] = []  # 处理前的原始音频（高通/增益之前）
         self.bursts = 0                 # 已丢弃的爆音块数
@@ -358,11 +382,47 @@ class Companion:
         return self.hpf(raw)
 
 
+    def _recover_capture(self, err: OSError) -> None:
+        """采集卡死/退出时重启 arecord。"""
+        print(f"\n[采集] {err}，重启 arecord", flush=True)
+        _elog(f"采集异常: {err}")
+        restart = getattr(self.in_stream, "restart", None)
+        if restart is None:
+            return
+        try:
+            restart()
+        except Exception as e:
+            _elog(f"重启采集失败: {e}")
+
+    def _safe_read(self) -> bytes:
+        """读到一块已加固定的上行音频；卡死时返回静音，不让主循环崩。
+
+        必须在线程里调用：arecord 的管道读是阻塞的，直接跑会把 asyncio
+        事件循环冻住（实测导致接收协程停摆、看门狗失效）。
+        """
+        try:
+            return self._boost(self.read_chunk())
+        except OSError as e:
+            self._recover_capture(e)
+            return b"\x00" * CHUNK
+
+    def _safe_read_raw(self) -> bytes:
+        """唤醒循环用：只做重采样/高通，不加固定增益（KWS 自带 AGC）。"""
+        try:
+            return self.read_chunk()
+        except OSError as e:
+            self._recover_capture(e)
+            return b"\x00" * CHUNK
+
     def drain_input(self, seconds: float = 0.5) -> None:
         """丢掉输入流里积压的旧音频（会话开始前/结束后清尾巴）。"""
         n = int(seconds * 10)  # 每 chunk = 100ms
         for _ in range(n):
-            self.read_chunk()
+            try:
+                self.read_chunk()
+            except OSError as e:
+                self._recover_capture(e)
+                return
 
     # ---------- 播放 ----------
     def _play_loop(self) -> None:
@@ -391,12 +451,26 @@ class Companion:
         n_recv = 0
         n_empty = 0
         suppressed: dict = {}
+        diag_at = time.monotonic()
         try:
             while self.running and not self.session_done:
                 try:
                     resp = await asyncio.wait_for(
-                        self.client.receive_server_response(), timeout=1.0)
+                        self.client.receive_server_response(),
+                        timeout=1.0)
                 except asyncio.TimeoutError:
+                    # 诊断：recv 一直超时时，看 websocket 内部队列里到底有没有帧
+                    if time.monotonic() - diag_at > 5:
+                        diag_at = time.monotonic()
+                        q = getattr(getattr(self.client.ws, "messages", None),
+                                    "qsize", None)
+                        try:
+                            qs = q() if q else "?"
+                        except Exception:
+                            qs = "err"
+                        _elog(f"diag recv超时 n_recv={n_recv} 队列={qs} "
+                              f"状态={getattr(self.client.ws, 'state', '?')} "
+                              f"open={getattr(self.client.ws, 'open', '?')}")
                     continue
                 except Exception as e:
                     print(f"\n接收中断: {e}")
@@ -413,6 +487,8 @@ class Companion:
                 self.last_response_time = time.time()
                 event = resp.get("event")
                 mt = resp.get("message_type")
+                if n_recv <= 3:
+                    print(f"[recv] #{n_recv} ev={event} mt={mt}", flush=True)
                 if mt == "SERVER_ACK" and isinstance(resp.get("payload_msg"), bytes):
                     _elog(f"TTS {len(resp['payload_msg'])}B (累计recv={n_recv})")
                 elif event in (450, 451, 50, 150, 154, 52):
@@ -523,7 +599,7 @@ class Companion:
                     raw = b"\x00" * CHUNK   # 发完后补静音
                 await asyncio.sleep(0.1)
             else:
-                raw = self._boost(self.read_chunk())
+                raw = await asyncio.to_thread(self._safe_read)
             # 半双工：豆包在说话（合成中或还有音频没放完）就不上行，
             # 同时也不喂 KWS（避免扬声器里的"再见"误触发）
             busy = self.doubao_speaking or not self.audio_q.empty()
@@ -563,6 +639,12 @@ class Companion:
             data = norm if gate_keep > 0 else b"\x00" * len(raw)
             if self.debug:
                 self._debug_buf.append(data)
+                if self._dbg_fh is not None:   # 实时落盘，会话中途也能验尸
+                    try:
+                        self._dbg_fh.write(data)
+                        self._dbg_fh.flush()
+                    except (OSError, ValueError):
+                        pass
             now = time.monotonic()
             if self._last_send > 0:
                 interval = (now - self._last_send) * 1000
@@ -597,6 +679,11 @@ class Companion:
         self._debug_buf.clear()
         self._raw_buf.clear()
         self.bursts = 0
+        if self.debug:
+            try:
+                self._dbg_fh = open("debug_sent.raw", "wb")
+            except OSError:
+                self._dbg_fh = None
         try:
             t_start = time.monotonic()
             await self.client.connect()
@@ -636,6 +723,12 @@ class Companion:
             if self.kws is not None:
                 self.kws.set_exit_enabled(False)
             if self.debug:
+                if self._dbg_fh is not None:
+                    try:
+                        self._dbg_fh.close()
+                    except OSError:
+                        pass
+                    self._dbg_fh = None
                 self._save_debug_audio()
             self.drain_input(0.3)   # 清掉会话结束时的尾巴，防止误唤醒
 
@@ -670,7 +763,7 @@ class Companion:
         peak_at = time.time()
         try:
             while self.running:
-                data = self.read_chunk()
+                data = await asyncio.to_thread(self._safe_read_raw)
                 # 麦克风电平自检：每秒最多打一行，静音时不打，用来区分
                 # "根本没拾到声音" 和 "拾到了但唤醒词没命中"
                 x = np.frombuffer(data, dtype=np.int16)
@@ -683,8 +776,8 @@ class Companion:
                     if nsamp and peak > 150:
                         rms = math.sqrt(sumsq / nsamp)
                         bar = "#" * min(30, peak // 400)
-                        print(f"[mic] 峰值 {peak:5d} rms {rms:.4f} {bar}",
-                              flush=True)
+                        print(f"[mic {time.strftime('%H:%M:%S')}] 峰值 {peak:5d} "
+                              f"rms {rms:.4f} {bar}", flush=True)
                     peak = 0
                     sumsq = 0.0
                     nsamp = 0
