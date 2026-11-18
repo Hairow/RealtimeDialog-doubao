@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import numpy as np
 import pyaudio
@@ -31,6 +32,12 @@ IDLE_EXIT_SECONDS = 30  # 服务端 30 秒无响应自动结束会话
 UPLINK_GAIN = 4.0       # 上行固定增益：Mac 内置麦拾音弱，实测语音 RMS 只有正常 1/5
 GATE_RMS = 0.10         # 上行噪门阈值：低于它的块发静音（增益后底噪~0.06、语音~0.2+）
 GATE_HANGOVER = 10      # 说话结束后保持放行的块数（10 块 = 1 秒，防止切断词尾）
+
+
+def _elog(msg: str) -> None:
+    """事件日志（毫秒时间戳），排查实跑与回放差异用。"""
+    with open("companion_events.log", "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%H:%M:%S')}+{int(time.time()*1000)%1000:03d} {msg}\n")
 
 
 def ensure_input_volume(target: int = 100) -> None:
@@ -151,6 +158,12 @@ class Companion:
             self.last_response_time = time.time()
             if resp == {}:
                 continue
+            event = resp.get("event")
+            mt = resp.get("message_type")
+            if mt == "SERVER_ACK" and isinstance(resp.get("payload_msg"), bytes):
+                _elog(f"TTS {len(resp['payload_msg'])}B")
+            elif event not in (450, 451, 50, 150, 154, 52):
+                _elog(f"event={event} mt={mt} payload={str(resp.get('payload_msg'))[:100]}")
             try:
                 event = resp.get("event")
                 if resp.get("message_type") == "SERVER_ACK" and isinstance(
@@ -163,6 +176,7 @@ class Companion:
                     payload = resp.get("payload_msg") or {}
                     for r in payload.get("results", []):
                         if not r.get("is_interim") and r.get("text"):
+                            _elog(f"转写: {r['text']}")
                             print(f"\r孩子说: {r['text']}")
                 elif event == 550:
                     payload = resp.get("payload_msg") or {}
@@ -194,6 +208,7 @@ class Companion:
         muted = False
         chunks_sent = 0
         gate_keep = 0   # 噪门放行剩余块数
+        self._last_send = 0.0
         while self.running and not self.session_done:
             raw = self._boost(self.read_chunk())
             # 半双工：豆包在说话（合成中或还有音频没放完）就不上行，
@@ -228,12 +243,22 @@ class Companion:
             data = raw if gate_keep > 0 else b"\x00" * len(raw)
             if self.debug:
                 self._debug_buf.append(data)
+            now = time.monotonic()
+            if self._last_send > 0:
+                interval = (now - self._last_send) * 1000
+                if interval > 300:  # 超过 3 个块周期，说明发送节奏被卡住
+                    _elog(f"!! 发送间隔 {interval:.0f}ms (chunk#{chunks_sent})")
+            self._last_send = now
             try:
                 await self.client.task_request(data)
                 chunks_sent += 1
+                if chunks_sent % 10 == 0:
+                    _elog(f"sent#{chunks_sent} rms={rms:.3f} gate={gate_keep} "
+                          f"muted={muted} alive={self.session_done}")
                 if self.debug and chunks_sent % 10 == 0:
                     print(f"[debug] 已上行 {chunks_sent} 块音频")
             except Exception as e:
+                _elog(f"上行失败: {e}")
                 print(f"\n[上行失败] {e}")
                 self.session_done = True
                 return
@@ -250,7 +275,9 @@ class Companion:
         self.drain_input(0.5)   # 丢掉唤醒前后积压的旧音频
         self._debug_buf.clear()
         try:
+            t_start = time.monotonic()
             await self.client.connect()
+            _elog(f"连接+会话建立 {time.monotonic()-t_start:.2f}s")
             if self.kws is not None:
                 self.kws.set_exit_enabled(True)
             tasks = [asyncio.create_task(self.receive_loop()),
@@ -259,11 +286,15 @@ class Companion:
                 while self.running and not self.session_done:
                     if time.time() - self.last_response_time > IDLE_EXIT_SECONDS:
                         print("\n30 秒没有对话，自动结束本次会话。")
+                        _elog("30s 看门狗结束会话")
                         break
                     await asyncio.sleep(0.2)
             finally:
                 self.session_done = True
-                await self.client.finish_session()
+                try:
+                    await self.client.finish_session()
+                except Exception as e:
+                    _elog(f"finish_session 异常: {e}")
                 # 等收尾事件/播放完
                 deadline = time.time() + 5
                 while time.time() < deadline and (not self.audio_q.empty()):
@@ -271,8 +302,13 @@ class Companion:
                 await asyncio.sleep(0.8)  # 让最后一小段播完
                 for t in tasks:
                     t.cancel()
-                await self.client.finish_connection()
-                await self.client.close()
+                # 等两个任务真正退出，避免收尾时 recv 竞态
+                await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await self.client.finish_connection()
+                    await self.client.close()
+                except Exception as e:
+                    _elog(f"收尾连接异常: {e}")
         finally:
             if self.kws is not None:
                 self.kws.set_exit_enabled(False)
