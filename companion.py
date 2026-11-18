@@ -62,11 +62,11 @@ def ensure_input_volume(target: int = 100) -> None:
 
 def _chime_bytes() -> bytes:
     """一声短促的"叮"，提示唤醒成功。"""
-    rate, dur = 24000, 0.18
+    rate, dur = 24000, 0.22
     n = int(rate * dur)
     t = np.arange(n)
     fade = np.minimum(1.0, np.minimum(t, n - 1 - t) / (0.02 * rate))
-    wave = 0.5 * np.sin(2 * math.pi * 880 * t / rate) * fade
+    wave = 0.75 * np.sin(2 * math.pi * 880 * t / rate) * fade
     return (wave * 32767).astype(np.int16).tobytes()
 
 
