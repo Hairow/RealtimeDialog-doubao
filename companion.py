@@ -33,6 +33,9 @@ IDLE_EXIT_SECONDS = 30  # 服务端 30 秒无响应自动结束会话
 UPLINK_GAIN = 4.0       # 上行固定增益：Mac 内置麦拾音弱，实测语音 RMS 只有正常 1/5
 GATE_RMS = 0.10         # 上行噪门阈值：低于它的块发静音（增益后底噪~0.06、语音~0.2+）
 GATE_HANGOVER = 10      # 说话结束后保持放行的块数（10 块 = 1 秒，防止切断词尾）
+AGC_TARGET = 0.10       # 上行 AGC 目标 RMS（-20dBFS，服务端 VAD 的舒适区）
+AGC_FLOOR = 0.012       # 低于它视为底噪：不放大，让噪门去切静音
+AGC_MAX = 10.0          # AGC 最大提升倍数（叠加固定增益后总能盖过阈值）
 IS_LINUX = sys.platform.startswith("linux")
 
 
@@ -160,6 +163,8 @@ class Companion:
         self.gain = gain                # 上行固定增益（不同麦克风灵敏度差很多）
         self.gate = gate                # 上行噪门阈值
         self.threshold = threshold      # 唤醒词判定阈值（麦克风弱就调低）
+        self.agc_gain = 1.0             # 上行 AGC 当前增益（跨块平滑）
+        self.agc_max = AGC_MAX          # AGC 最大提升倍数
         self._synth_chunks: list | None = None
         self._synth_idx = 0
         self.session_id = str(uuid.uuid4())
@@ -329,6 +334,26 @@ class Companion:
         x = (np.frombuffer(data, dtype=np.int16).astype(np.float64) * self.gain)
         return np.clip(np.rint(x), -32768, 32767).astype(np.int16).tobytes()
 
+    def _agc(self, data: bytes) -> tuple[bytes, float]:
+        """上行 AGC：把语音拉到距满刻度约 -20dBFS 的目标电平。
+
+        笔记本内置麦的问题是动态范围——喊唤醒词有 -30dBFS，正常说话只有
+        -40dBFS，服务端 VAD 只认前一种。固定增益要么盖不住小声、要么把
+        喊声削平，所以这里按块做 RMS 归一化：底噪段不动增益（交给噪门切
+        静音），有声音的段按 目标/rms 平滑调整，限幅在 0.5~max 之间。
+        返回（处理后的 PCM，处理前的 RMS）。
+        """
+        x = np.frombuffer(data, dtype=np.int16).astype(np.float64) / 32768.0
+        rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
+        if rms < AGC_FLOOR:                 # 底噪：不放大，增益缓慢回落
+            self.agc_gain = max(1.0, self.agc_gain * 0.97)
+            return data, rms
+        target = float(np.clip(AGC_TARGET / max(rms, 1e-6), 0.5, self.agc_max))
+        # 慢起快落：说话开头不至于突变，收尾不至于拖长
+        self.agc_gain = 0.6 * self.agc_gain + 0.4 * target
+        y = np.clip(x * self.agc_gain, -1.0, 1.0)
+        return (y * 32767).astype(np.int16).tobytes(), rms
+
     # ---------- 会话中的麦克风（半双工 + 噪门 + 结束词监听） ----------
     def _prepare_synthetic(self) -> None:
         """生成合成测试音频（say + afconvert），切成 3200B 块备用。"""
@@ -388,13 +413,12 @@ class Companion:
             # 噪门：增益后底噪仍会顶住服务端 VAD，低于阈值发静音，
             # 让服务器能判断"说完了"。注意必须用 float64 计算 RMS，
             # int16 平方会溢出成负数 -> NaN -> 噪门永远不开（踩过的坑）
-            rms = float(np.sqrt(np.mean(
-                np.frombuffer(raw, np.int16).astype(np.float64) ** 2)) / 32768.0)
+            norm, rms = self._agc(raw)      # AGC 按块归一到 -20dBFS 附近
             if rms > self.gate:
                 gate_keep = GATE_HANGOVER
             elif gate_keep > 0:
                 gate_keep -= 1
-            data = raw if gate_keep > 0 else b"\x00" * len(raw)
+            data = norm if gate_keep > 0 else b"\x00" * len(raw)
             if self.debug:
                 self._debug_buf.append(data)
             now = time.monotonic()
@@ -408,7 +432,8 @@ class Companion:
                 chunks_sent += 1
                 if chunks_sent % 10 == 0:
                     _elog(f"sent#{chunks_sent} rms={rms:.3f} gate={gate_keep} "
-                          f"muted={muted} alive={self.session_done}")
+                          f"agc={self.agc_gain:.1f} muted={muted} "
+                          f"alive={self.session_done}")
                 if self.debug and chunks_sent % 10 == 0:
                     print(f"[debug] 已上行 {chunks_sent} 块音频")
             except Exception as e:
