@@ -12,6 +12,7 @@ import asyncio
 import math
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -27,6 +28,23 @@ from wakeup import SAMPLE_RATE as IN_RATE, WAKE_LABEL, WakeSpotter
 OUT_RATE = config.output_audio_config["sample_rate"]   # 24000
 CHUNK = config.input_audio_config["chunk"]             # 3200 字节 = 100ms
 IDLE_EXIT_SECONDS = 30  # 服务端 30 秒无响应自动结束会话
+UPLINK_GAIN = 4.0       # 上行固定增益：Mac 内置麦拾音弱，实测语音 RMS 只有正常 1/5
+
+
+def ensure_input_volume(target: int = 100) -> None:
+    """把系统输入音量拉到 target（Mac 内置麦默认偏低会导致 ASR 听不清）。"""
+    try:
+        cur = int(subprocess.run(
+            ["osascript", "-e", "input volume of (get volume settings)"],
+            capture_output=True, text=True, timeout=5).stdout.strip() or "0")
+        if cur < target:
+            subprocess.run(["osascript", "-e", f"set volume input volume {target}"],
+                           capture_output=True, timeout=5)
+            print(f"[提示] 系统输入音量 {cur}% → {target}%")
+        else:
+            print(f"[提示] 系统输入音量 {cur}%")
+    except Exception as e:
+        print(f"[提示] 无法调整输入音量: {e}")
 
 
 def _chime_bytes() -> bytes:
@@ -162,13 +180,19 @@ class Companion:
                 # 单条消息解析失败只跳过，不让接收循环静默死亡
                 print(f"\n[解析异常 event={resp.get('event')}] {e}")
 
+    @staticmethod
+    def _boost(data: bytes) -> bytes:
+        """上行固定增益 + 饱和限幅（唤醒已有动态 AGC，上行用保守增益）。"""
+        x = (np.frombuffer(data, dtype=np.int16).astype(np.float64) * UPLINK_GAIN)
+        return np.clip(np.rint(x), -32768, 32767).astype(np.int16).tobytes()
+
     # ---------- 会话中的麦克风（半双工 + 结束词监听） ----------
     async def mic_loop(self) -> None:
         print("麦克风已开，直接说话即可。豆包说话时会自动闭麦。")
         muted = False
         chunks_sent = 0
         while self.running and not self.session_done:
-            data = self.read_chunk()
+            data = self._boost(self.read_chunk())
             if self.debug:
                 self._debug_buf.append(data)
             # 半双工：豆包在说话（合成中或还有音频没放完）就不上行，
@@ -263,6 +287,7 @@ class Companion:
         print("  会话中喊\"再见/别说了/停下\"等结束，或 30 秒不说话自动结束")
         print("  Ctrl+C = 退出")
         print("=" * 50)
+        ensure_input_volume()
         self.kws = WakeSpotter(threshold=0.10)
         print("唤醒词模型已加载，正在监听...")
         try:
