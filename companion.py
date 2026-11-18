@@ -51,6 +51,105 @@ def _rms_int16(data: bytes) -> float:
     return float(np.sqrt(np.mean(x * x))) if x.size else 0.0
 
 
+class HighPass:
+    """二阶 Butterworth 高通（120Hz），实时流式处理。
+
+    笔记本内置麦在 +50dB 增益下会收进大量 50Hz 工频哼声和低频隆隆，
+    它们占了相当一部分能量却完全不含语音，会顶住噪门、拖偏 AGC 的 RMS。
+    砍掉 120Hz 以下，语音几乎无损，噪声却能少两三 dB。
+    """
+
+    def __init__(self, fc: float = 120.0, fs: int = IN_RATE) -> None:
+        w0 = 2.0 * math.pi * fc / fs
+        cw, sw = math.cos(w0), math.sin(w0)
+        alpha = sw / (2.0 * 0.7071)
+        a0 = 1.0 + alpha
+        self.b = ((1.0 + cw) / 2.0 / a0, -(1.0 + cw) / a0, (1.0 + cw) / 2.0 / a0)
+        self.a = (-2.0 * cw / a0, (1.0 - alpha) / a0)
+        self.z1 = 0.0
+        self.z2 = 0.0
+
+    def __call__(self, data: bytes) -> bytes:
+        x = np.frombuffer(data, dtype=np.int16).astype(np.float64) / 32768.0
+        if not x.size:
+            return data
+        b0, b1, b2 = self.b
+        a1, a2 = self.a
+        y = np.empty_like(x)
+        z1, z2 = self.z1, self.z2
+        for i in range(x.size):          # 直接写转置二型（II）差分方程
+            xi = x[i]
+            yi = b0 * xi + z1
+            z1 = b1 * xi - a1 * yi + z2
+            z2 = b2 * xi - a2 * yi
+            y[i] = yi
+        self.z1, self.z2 = z1, z2
+        return (np.clip(y, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+
+def _is_burst(data: bytes) -> bool:
+    """识别采集流的整块爆音。
+
+    这台机器的 HDA 驱动偶发把满量程垃圾塞进采集流（实测约 1/8 概率），
+    特征是一整块电平爆高且频谱接近白噪。丢掉它，别让它开噪门、别写进
+    上行，也别喂给唤醒模型。
+    """
+    x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    if not x.size:
+        return False
+    peak = float(np.abs(x).max())
+    rms = float(np.sqrt(np.mean(x * x)))
+    return peak > 0.75 and rms > 0.25
+
+
+def _flatness(x: np.ndarray) -> float:
+    """谱平坦度（0=纯音，1=白噪）。人声有谐波结构，噪声更平坦。"""
+    n = 512
+    if x.size < n:
+        return 1.0
+    seg = x[: n * (x.size // n)].reshape(-1, n)[-1] * np.hanning(n)
+    p = np.abs(np.fft.rfft(seg)) ** 2 + 1e-12
+    return float(np.exp(np.mean(np.log(p))) / np.mean(p))
+
+
+class WebrtcFrontend:
+    """WebRTC 音频前端（降噪 + 高通 + 语音检测），移植自 xiaoai-plus 的思路。
+
+    xiaoai-plus 在音箱上用的是 libwebrtc_audio_processing（AEC + NS + AGC），
+    其中降噪与语音检测这两块在笔记本上同样有效：NS 对平稳噪声（风扇、工频）
+    的抑制比手写的电平噪门准得多，is_speech 还能给出真正的 VAD 判决。
+
+    这里用 webrtc-noise-gain（同一套 WebRTC 算法的 Python 绑定），按 10ms
+    帧处理；单独留一份 HPF 作为装不上时的回退。
+    """
+
+    def __init__(self, ns_level: int = 2) -> None:
+        from webrtc_noise_gain import AudioProcessor
+        self.ap = AudioProcessor(auto_gain=0, noise_suppression=ns_level)
+        self.is_speech = False          # 最近一块里是否出现语音帧
+        # WebRTC 的降噪按"正常通话电平"设计，对 -40dBFS 的弱信号会把语音
+        # 一起判成噪声抹掉（实测：不预增益时直接降噪，原本可识别的样本变成
+        # 零返回；预增益 8x 后再降噪恢复正常）。所以内部先抬电平、出结果再
+        # 还原，下游拿到的音量与处理前一致。
+        self.pre = 8.0
+
+    def __call__(self, data: bytes) -> bytes:
+        x = np.frombuffer(data, dtype=np.int16).astype(np.float64) * self.pre
+        x = np.clip(x, -32768, 32767).astype(np.int16)
+        n = len(x) // 160 * 160          # 只处理整 10ms 帧
+        if n == 0:
+            return data
+        out = np.empty(n, dtype=np.float64)
+        speech = False
+        for i in range(0, n, 160):
+            r = self.ap.Process10ms(x[i:i + 160].tobytes())
+            out[i:i + 160] = np.frombuffer(r.audio, dtype=np.int16)
+            speech = speech or bool(r.is_speech)
+        self.is_speech = speech
+        out /= self.pre
+        return np.clip(out, -32768, 32767).astype(np.int16).tobytes()
+
+
 def ensure_input_volume(target: int = 100) -> None:
     """把系统输入音量拉到 target（Mac 内置麦默认偏低会导致 ASR 听不清）。"""
     if not sys.platform == "darwin":
@@ -92,7 +191,10 @@ class AlsaCapture:
         self._buf = b""
         self.proc = subprocess.Popen(
             ["arecord", "-q", "-D", device, "-f", "S16_LE",
-             "-r", str(rate), "-c", str(channels), "-t", "raw"],
+             "-r", str(rate), "-c", str(channels), "-t", "raw",
+             # 显式指定缓冲/周期（借自 xiaoai-plus 的 recorder_arecord.cpp）：
+             # 不指定时驱动会按默认值给，老 HDA 上容易出现周期性抖动和突刺。
+             "--buffer-size", "4800", "--period-size", "480"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 
     def read(self, nbytes: int, exception_on_overflow: bool = False) -> bytes:
@@ -160,7 +262,7 @@ class Companion:
                  synthetic: bool = False, alsa: bool = False,
                  device_in: str = "default", device_out: str = "bt",
                  gain: float = UPLINK_GAIN, gate: float = GATE_RMS,
-                 threshold: float = 0.10) -> None:
+                 threshold: float = 0.10, ns_level: int = 2) -> None:
         self.enter_mode = enter_mode
         self.synthetic = synthetic      # --synthetic：不发麦克风，发合成测试音频
         self.alsa = alsa                # --alsa：Linux 上用 arecord/aplay 子进程
@@ -194,6 +296,23 @@ class Companion:
         self.kws: WakeSpotter | None = None  # 仅唤醒模式加载
         self.debug = debug              # --debug 时保存发给服务器的原声
         self._debug_buf: list[bytes] = []
+        self.raw_buf_ok = True           # 原始音频留档
+        self._raw_buf: list[bytes] = []  # 处理前的原始音频（高通/增益之前）
+        self.bursts = 0                 # 已丢弃的爆音块数
+        self.hpf = HighPass(120.0, IN_RATE)  # 去掉 120Hz 以下工频与隆隆声
+        self.frontend = None            # WebRTC 降噪前端（装得上就用）
+        self.ns_level = ns_level
+        if ns_level > 0:
+            try:
+                self.frontend = WebrtcFrontend(ns_level)
+                print(f"[音频] 已启用 WebRTC 降噪（等级 {ns_level}）与语音检测")
+                # 降噪会把底噪压到 0.001 量级，语音也同步变小，原来的
+                # 噪门阈值（0.015）会把正常说话一起切掉，这里跟着下移。
+                if self.gate > 0.006:
+                    self.gate = 0.005
+                    print(f"[音频] 噪门阈值随降噪调整为 {self.gate}")
+            except Exception as e:
+                print(f"[音频] WebRTC 降噪不可用（{e}），退回高通滤波")
         # 全程共用一个输入流（避免待机/会话各开一个的冲突）
         self.in_stream, self.in_rate = self.open_input()
         self.player = threading.Thread(target=self._play_loop, daemon=True)
@@ -219,17 +338,25 @@ class Companion:
                                 frames_per_buffer=CHUNK), rate
 
     def read_chunk(self, in_stream=None, rate: int | None = None) -> bytes:
-        """读 100ms 音频，必要时重采样到 16k。"""
+        """读 100ms 音频：重采样到 16k → 丢爆音 → 高通。"""
         in_stream = in_stream or self.in_stream
         rate = rate or self.in_rate
         raw = in_stream.read(int(CHUNK * rate / IN_RATE),
                              exception_on_overflow=False)
-        if rate == IN_RATE:
-            return raw
-        x = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
-        target = len(x) * IN_RATE // rate
-        idx = np.linspace(0, len(x) - 1, target)
-        return np.interp(idx, np.arange(len(x)), x).astype(np.int16).tobytes()
+        if rate != IN_RATE:
+            x = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+            target = len(x) * IN_RATE // rate
+            idx = np.linspace(0, len(x) - 1, target)
+            raw = np.interp(idx, np.arange(len(x)), x).astype(np.int16).tobytes()
+        if _is_burst(raw):               # 驱动偶发塞进来的满量程垃圾
+            self.bursts += 1
+            raw = b"\x00" * len(raw)
+        if self.debug:
+            self._raw_buf.append(raw)    # 存处理前的原始音频，供离线验尸
+        if self.frontend is not None:    # WebRTC：降噪 + 高通 + VAD
+            return self.frontend(raw)
+        return self.hpf(raw)
+
 
     def drain_input(self, seconds: float = 0.5) -> None:
         """丢掉输入流里积压的旧音频（会话开始前/结束后清尾巴）。"""
@@ -468,6 +595,8 @@ class Companion:
         in_stream = self.in_stream
         self.drain_input(0.5)   # 丢掉唤醒前后积压的旧音频
         self._debug_buf.clear()
+        self._raw_buf.clear()
+        self.bursts = 0
         try:
             t_start = time.monotonic()
             await self.client.connect()
@@ -584,6 +713,14 @@ class Companion:
             wf.writeframes(b"".join(self._debug_buf))
         print(f"[debug] 已保存发给服务器的原声: {path} "
               f"({len(self._debug_buf)} 块, {len(self._debug_buf) / 10:.1f}s)")
+        if self._raw_buf:
+            with wave.open("debug_raw.wav", "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(IN_RATE)
+                wf.writeframes(b"".join(self._raw_buf))
+            print(f"[debug] 已保存处理前原始音频: debug_raw.wav "
+                  f"({len(self._raw_buf)} 块) 丢弃爆音 {self.bursts} 块")
 
     # ---------- 主流程 ----------
     async def run(self) -> None:
@@ -621,9 +758,11 @@ if __name__ == "__main__":
     ap.add_argument("--gate", type=float, default=GATE_RMS, help="噪门阈值（0-1 的 RMS）")
     ap.add_argument("--threshold", type=float, default=0.10,
                     help="唤醒词阈值（0.05~0.25，麦克风弱就调低）")
+    ap.add_argument("--ns", type=int, default=2,
+                    help="WebRTC 降噪等级 0~3（0=关闭，退回高通滤波）")
     a = ap.parse_args()
     asyncio.run(Companion(
         enter_mode=a.enter, debug=a.debug, synthetic=a.synthetic,
         alsa=a.alsa, device_in=a.device_in, device_out=a.device_out,
-        gain=a.gain, gate=a.gate, threshold=a.threshold,
+        gain=a.gain, gate=a.gate, threshold=a.threshold, ns_level=a.ns,
     ).run())
