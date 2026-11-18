@@ -16,14 +16,17 @@ class RealtimeDialogClient:
         self.session_id = session_id
         self.ws = None
 
-    async def connect(self) -> None:
-        """建立WebSocket连接"""
-        print(f"url: {self.config['base_url']}")
+    async def _handshake(self) -> None:
+        """WebSocket 握手 + StartConnection。
+
+        这两步与具体会话无关，可以提前到待机时做（预建连接），
+        唤醒后只剩一次 StartSession 往返，省 0.3~0.5s。
+        ping keepalive 防止待机久了 NAT/服务端把空闲连接掐掉。
+        """
         self.ws = await websockets.connect(
             self.config['base_url'],
             extra_headers=self.config['headers'],
-            ping_interval=None
-        )
+            ping_interval=20, ping_timeout=10)
         self.logid = self.ws.response_headers.get("X-Tt-Logid")
         print(f"dialog server response logid: {self.logid}")
 
@@ -38,6 +41,7 @@ class RealtimeDialogClient:
         response = await self.ws.recv()
         print(f"StartConnection response: {protocol.parse_response(response)}")
 
+    async def _start_session(self) -> None:
         # StartSession request
         request_params = config.start_session_req
         payload_bytes = str.encode(json.dumps(request_params))
@@ -51,6 +55,24 @@ class RealtimeDialogClient:
         await self.ws.send(start_session_request)
         response = await self.ws.recv()
         print(f"StartSession response: {protocol.parse_response(response)}")
+
+    async def connect(self) -> None:
+        """建立WebSocket连接（若已预建则只补 StartSession）"""
+        print(f"url: {self.config['base_url']}")
+        if self.ws is None:
+            await self._handshake()
+        try:
+            await self._start_session()
+        except Exception:
+            # 预建连接可能已被服务端/网络回收（待机久了）：重建握手再试一次
+            print("[connect] 预建连接失效，重新建连...")
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+            await self._handshake()
+            await self._start_session()
 
     async def task_request(self, audio: bytes) -> None:
         task_request = bytearray(

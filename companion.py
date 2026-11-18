@@ -314,6 +314,7 @@ class Companion:
         self.client = RealtimeDialogClient(config=config.ws_connect_config,
                                            session_id=self.session_id)
         self.pa = None
+        self._preconnect_task: "asyncio.Task | None" = None
         if alsa:
             self.out_stream = AlsaPlayback(device_out, rate=OUT_RATE)
             print(f"[音频] 输出设备: {device_out!r}")
@@ -636,6 +637,15 @@ class Companion:
                 if not muted:
                     print("…（豆包说话中，闭麦）")
                     muted = True
+                # 保持上行流连续：闭麦期间发静音而不是完全停止发送。
+                # 长时间空窗（十几秒故事）可能让服务端对话状态停摆，
+                # 表现为故事讲完后孩子说话它完全没反应（间歇性"聋掉"）
+                try:
+                    await self.client.task_request(b"\x00" * CHUNK)
+                except Exception as e:
+                    _elog(f"闭麦静音上行失败: {e}")
+                    self.session_done = True
+                    return
                 continue
             if muted:
                 print("…（恢复拾音）")
@@ -701,10 +711,17 @@ class Companion:
         self.session_done = False
         self.doubao_speaking = False
         self.last_response_time = time.time()
-        self.client = RealtimeDialogClient(
-            config=config.ws_connect_config, session_id=str(uuid.uuid4()))
+        # 若预建连接还在握手路上，先收掉，避免与正式建连竞争
+        if self._preconnect_task is not None:
+            self._preconnect_task.cancel()
+            self._preconnect_task = None
+        if self.client is None or self.client.ws is None:
+            self.client = RealtimeDialogClient(
+                config=config.ws_connect_config, session_id=str(uuid.uuid4()))
         in_stream = self.in_stream
-        self.drain_input(0.5)   # 丢掉唤醒前后积压的旧音频
+        # 0.5s 会吃掉孩子紧跟着唤醒词说的前几个字（"豆包豆包讲个故事"），
+        # 残句会让服务器端点判定等更久；0.2s 足够清掉管道残留
+        self.drain_input(0.2)   # 丢掉唤醒前后积压的旧音频
         self._debug_buf.clear()
         self._raw_buf.clear()
         self.play_deadline = 0.0
@@ -749,6 +766,9 @@ class Companion:
                     await self.client.close()
                 except Exception as e:
                     _elog(f"收尾连接异常: {e}")
+                # 会话连接已关闭，换一个干净的客户端给下一次预建连接用
+                self.client = RealtimeDialogClient(
+                    config=config.ws_connect_config, session_id=str(uuid.uuid4()))
         finally:
             if self.kws is not None:
                 self.kws.set_exit_enabled(False)
@@ -761,6 +781,31 @@ class Companion:
                     self._dbg_fh = None
                 self._save_debug_audio()
             self.drain_input(0.3)   # 清掉会话结束时的尾巴，防止误唤醒
+
+    # ---------- 预建连接 ----------
+    def _kick_preconnect(self) -> None:
+        """待机时提前做 WebSocket 握手 + StartConnection，
+        唤醒后只剩一次 StartSession 往返（省 0.3~0.5s）。
+        连接失效也有 connect() 里的重建兜底，所以失败不致命。"""
+        self._preconnect_task = asyncio.create_task(self._preconnect())
+
+    async def _preconnect(self) -> None:
+        try:
+            await self.client._handshake()
+            _elog("预建连接完成")
+        except asyncio.CancelledError:
+            # 唤醒时取消了还在半路的预建连接：清掉半握手状态，
+            # 否则 run_session 会误以为 ws 可用（StartConnection 还没确认）
+            if self.client.ws is not None:
+                try:
+                    await self.client.ws.close()
+                except Exception:
+                    pass
+                self.client.ws = None
+            raise
+        except Exception as e:
+            _elog(f"预建连接失败（唤醒时会自动重建）: {e}")
+            self.client.ws = None
 
     # ---------- 回车触发模式 ----------
     async def _enter_loop(self) -> None:
@@ -786,6 +831,7 @@ class Companion:
         ensure_input_volume()
         self.kws = WakeSpotter(threshold=self.threshold)
         self.chime()   # 启动自检音：听不到说明播放链路有问题
+        self._kick_preconnect()   # 待机时就把连接建好
         print(f"唤醒词模型已加载，正在监听...（阈值 {self.threshold}）", flush=True)
         peak = 0
         sumsq = 0.0
@@ -821,6 +867,7 @@ class Companion:
                     await self.run_session()
                     if self.running:
                         print("已回到待机，喊\"豆包豆包\"可以再来。")
+                        self._kick_preconnect()   # 为下一次唤醒预建连接
         finally:
             pass  # 输入流由 run() 统一关闭
 

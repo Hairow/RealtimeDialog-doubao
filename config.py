@@ -70,7 +70,10 @@ start_session_req = {
     "asr": {
         "extra": {
             "enable_custom_vad": True,
-            "end_smooth_window_ms": 1500,
+            # 服务器判定"说完了"的静音平滑窗口。1500ms 太保守，
+            # 唤醒后开口前的等待明显拉长；1000ms 是响应速度与
+            # "孩子说到一半停顿"之间的折中（提示词里已有 go on 兜底）
+            "end_smooth_window_ms": 1000,
         }
     },
     "tts": {
