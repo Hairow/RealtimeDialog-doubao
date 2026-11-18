@@ -230,6 +230,16 @@ class AlsaCapture:
         out, self._buf = self._buf[:nbytes], self._buf[nbytes:]
         return out
 
+    def flush_pending(self) -> None:
+        """丢掉管道里所有积压音频（半双工恢复时用，避免听到十几秒前的话）。"""
+        self._buf = b""
+        while True:
+            ready, _, _ = select.select([self.proc.stdout], [], [], 0)
+            if not ready:
+                break
+            if not self.proc.stdout.read(65536):
+                break
+
     def stop_stream(self) -> None:
         pass
 
@@ -413,6 +423,17 @@ class Companion:
         except OSError as e:
             self._recover_capture(e)
             return b"\x00" * CHUNK
+
+    def drop_pending(self) -> None:
+        """丢掉输入流积压（半双工恢复时管道可能攒了十几秒旧音频）。"""
+        flush = getattr(self.in_stream, "flush_pending", None)
+        if flush is None:
+            self.drain_input(0.2)
+            return
+        try:
+            flush()
+        except OSError as e:
+            self._recover_capture(e)
 
     def drain_input(self, seconds: float = 0.5) -> None:
         """丢掉输入流里积压的旧音频（会话开始前/结束后清尾巴）。"""
@@ -611,8 +632,8 @@ class Companion:
             if muted:
                 print("…（恢复拾音）")
                 muted = False
-                # 多吞掉一小段，避免回声尾巴
-                self.drain_input(0.2)
+                # 丢掉闭麦期间积压的旧音频，否则会听到十几秒前的声音
+                self.drop_pending()
             # 结束词监听（只在非闭麦时）
             if self.kws is not None:
                 hit = self.kws.feed(raw)
