@@ -258,12 +258,14 @@ class Companion:
                     _elog(f"recv_loop 异常退出: {e}")
                     break
                 n_recv += 1
-                self.last_response_time = time.time()
                 if resp == {}:
                     n_empty += 1
                     if n_empty <= 5:
                         _elog(f"空消息#{n_empty} type={type(resp)}")
                     continue
+                # 只有真实事件才刷新看门狗；空消息/心跳不刷新，
+                # 否则一次会话能被心跳无限续命，一直发静音烧额度
+                self.last_response_time = time.time()
                 event = resp.get("event")
                 mt = resp.get("message_type")
                 if mt == "SERVER_ACK" and isinstance(resp.get("payload_msg"), bytes):
