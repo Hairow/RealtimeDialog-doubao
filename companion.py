@@ -34,8 +34,8 @@ UPLINK_GAIN = 4.0       # 上行固定增益：Mac 内置麦拾音弱，实测�
 GATE_RMS = 0.10         # 上行噪门阈值：低于它的块发静音（增益后底噪~0.06、语音~0.2+）
 GATE_HANGOVER = 10      # 说话结束后保持放行的块数（10 块 = 1 秒，防止切断词尾）
 AGC_TARGET = 0.10       # 上行 AGC 目标 RMS（-20dBFS，服务端 VAD 的舒适区）
-AGC_FLOOR = 0.012       # 低于它视为底噪：不放大，让噪门去切静音
 AGC_MAX = 10.0          # AGC 最大提升倍数（叠加固定增益后总能盖过阈值）
+GATE_MARGIN = 1.8       # 自适应噪门倍数：超过底噪这么多倍才算"有人在说话"
 IS_LINUX = sys.platform.startswith("linux")
 
 
@@ -43,6 +43,12 @@ def _elog(msg: str) -> None:
     """事件日志（毫秒时间戳），排查实跑与回放差异用。"""
     with open("companion_events.log", "a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%H:%M:%S')}+{int(time.time()*1000)%1000:03d} {msg}\n")
+
+
+def _rms_int16(data: bytes) -> float:
+    """int16 PCM 的 RMS（0-1）。必须用 float64：int16 平方会溢出成负数。"""
+    x = np.frombuffer(data, dtype=np.int16).astype(np.float64) / 32768.0
+    return float(np.sqrt(np.mean(x * x))) if x.size else 0.0
 
 
 def ensure_input_volume(target: int = 100) -> None:
@@ -165,6 +171,7 @@ class Companion:
         self.threshold = threshold      # 唤醒词判定阈值（麦克风弱就调低）
         self.agc_gain = 1.0             # 上行 AGC 当前增益（跨块平滑）
         self.agc_max = AGC_MAX          # AGC 最大提升倍数
+        self.noise_floor = 0.010        # 跟踪中的底噪 RMS（自适应噪门用）
         self._synth_chunks: list | None = None
         self._synth_idx = 0
         self.session_id = str(uuid.uuid4())
@@ -334,18 +341,18 @@ class Companion:
         x = (np.frombuffer(data, dtype=np.int16).astype(np.float64) * self.gain)
         return np.clip(np.rint(x), -32768, 32767).astype(np.int16).tobytes()
 
-    def _agc(self, data: bytes) -> tuple[bytes, float]:
+    def _agc(self, data: bytes, enabled: bool = True) -> tuple[bytes, float]:
         """上行 AGC：把语音拉到距满刻度约 -20dBFS 的目标电平。
 
         笔记本内置麦的问题是动态范围——喊唤醒词有 -30dBFS，正常说话只有
         -40dBFS，服务端 VAD 只认前一种。固定增益要么盖不住小声、要么把
-        喊声削平，所以这里按块做 RMS 归一化：底噪段不动增益（交给噪门切
-        静音），有声音的段按 目标/rms 平滑调整，限幅在 0.5~max 之间。
+        喊声削平，所以这里按块做 RMS 归一化，且只对"判定为说话"的块生效：
+        静音段若也放大，底噪会被抬到 -20dBFS，服务端就无法判断句首句尾了。
         返回（处理后的 PCM，处理前的 RMS）。
         """
         x = np.frombuffer(data, dtype=np.int16).astype(np.float64) / 32768.0
         rms = float(np.sqrt(np.mean(x * x))) if x.size else 0.0
-        if rms < AGC_FLOOR:                 # 底噪：不放大，增益缓慢回落
+        if not enabled:                      # 静音段：不放大，增益缓慢回落
             self.agc_gain = max(1.0, self.agc_gain * 0.97)
             return data, rms
         target = float(np.clip(AGC_TARGET / max(rms, 1e-6), 0.5, self.agc_max))
@@ -413,11 +420,19 @@ class Companion:
             # 噪门：增益后底噪仍会顶住服务端 VAD，低于阈值发静音，
             # 让服务器能判断"说完了"。注意必须用 float64 计算 RMS，
             # int16 平方会溢出成负数 -> NaN -> 噪门永远不开（踩过的坑）
-            norm, rms = self._agc(raw)      # AGC 按块归一到 -20dBFS 附近
-            if rms > self.gate:
+            rms = _rms_int16(raw)
+            # 自适应噪门：底噪会随风扇/环境漂移，写死阈值不是好一点就是漏一点。
+            # 低于底噪快速下跟；落在底噪带内缓慢上爬；明显是语音则按住不动。
+            if rms < self.noise_floor:
+                self.noise_floor = 0.7 * self.noise_floor + 0.3 * rms
+            elif rms < self.noise_floor * GATE_MARGIN:
+                self.noise_floor = 0.98 * self.noise_floor + 0.02 * rms
+            thr = max(self.gate, self.noise_floor * GATE_MARGIN)
+            if rms > thr:
                 gate_keep = GATE_HANGOVER
             elif gate_keep > 0:
                 gate_keep -= 1
+            norm, _ = self._agc(raw, enabled=(gate_keep > 0))
             data = norm if gate_keep > 0 else b"\x00" * len(raw)
             if self.debug:
                 self._debug_buf.append(data)
@@ -431,8 +446,9 @@ class Companion:
                 await self.client.task_request(data)
                 chunks_sent += 1
                 if chunks_sent % 10 == 0:
-                    _elog(f"sent#{chunks_sent} rms={rms:.3f} gate={gate_keep} "
-                          f"agc={self.agc_gain:.1f} muted={muted} "
+                    _elog(f"sent#{chunks_sent} rms={rms:.3f} thr={thr:.3f} "
+                          f"gate={gate_keep} agc={self.agc_gain:.1f} "
+                          f"nf={self.noise_floor:.4f} muted={muted} "
                           f"alive={self.session_done}")
                 if self.debug and chunks_sent % 10 == 0:
                     print(f"[debug] 已上行 {chunks_sent} 块音频")
