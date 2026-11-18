@@ -121,13 +121,19 @@ class AlsaPlayback:
              "-r", str(rate), "-c", str(channels), "-t", "raw",
              "-B", str(buffer_us)],
             stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._dead = False
 
     def write(self, data: bytes) -> None:
         try:
             self.proc.stdin.write(data)
             self.proc.stdin.flush()
         except (BrokenPipeError, ValueError):
-            pass   # 播放进程已退出（设备断开），丢弃这块音频
+            # 播放进程已退出（设备被占用或断开），丢弃这块音频；
+            # 但只提示一次，否则每块都刷一行把日志淹了
+            if not self._dead:
+                self._dead = True
+                print("[音频] 播放进程已退出（设备被占用或断开），"
+                      "声音不会出来", flush=True)
 
     def stop_stream(self) -> None:
         pass
@@ -416,7 +422,6 @@ class Companion:
         self.session_done = False
         self.doubao_speaking = False
         self.last_response_time = time.time()
-        self.audio_q.queue.clear()
         self.client = RealtimeDialogClient(
             config=config.ws_connect_config, session_id=str(uuid.uuid4()))
         in_stream = self.in_stream
@@ -487,6 +492,7 @@ class Companion:
         print("=" * 50)
         ensure_input_volume()
         self.kws = WakeSpotter(threshold=self.threshold)
+        self.chime()   # 启动自检音：听不到说明播放链路有问题
         print(f"唤醒词模型已加载，正在监听...（阈值 {self.threshold}）", flush=True)
         peak = 0
         sumsq = 0.0
@@ -516,6 +522,8 @@ class Companion:
                 hit = self.kws.feed(data)
                 if hit == WAKE_LABEL:
                     print("\n🔔 唤醒！")
+                    # 先清掉上一轮残留，再放提示音；顺序反了会把"叮"清掉
+                    self.audio_q.queue.clear()
                     self.chime()
                     await self.run_session()
                     if self.running:
