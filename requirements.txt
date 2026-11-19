@@ -1,5 +1,6 @@
 numpy
 pyaudio
-sherpa-onnxwebrtc-noise-gain
+sherpa-onnx
+webrtc-noise-gain
 typing-extensions
 websockets==10.1
